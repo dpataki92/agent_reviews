@@ -1,31 +1,21 @@
 defmodule AgentReviews.Config do
   def load_effective_opts(root, opts) do
     defaults = %{
-      agent_cmd: "codex",
-      agent_args: "",
       model: nil,
-      reasoning_effort: nil,
-      full_auto: true,
-      skip_nitpicks: false,
-      auto_commit: false,
-      verbose: false,
-      checkout_default: nil
+      reasoning_effort: nil
     }
 
     user_cfg_path = Path.join(System.user_home!(), ".agent_reviews.toml")
     repo_cfg_path = Path.join(root, ".agent_reviews.toml")
 
     with {:ok, user_cfg} <- read_optional_config(user_cfg_path),
-         {:ok, repo_cfg} <- read_optional_config(repo_cfg_path),
-         {:ok, extra_cfg} <- read_many_optional_configs(Map.get(opts, :config_paths, [])) do
+         {:ok, repo_cfg} <- read_optional_config(repo_cfg_path) do
       cfg =
         defaults
         |> Map.merge(user_cfg)
         |> Map.merge(repo_cfg)
-        |> Map.merge(extra_cfg)
-        |> apply_env_overrides()
 
-      {:ok, apply_config_to_opts(opts, cfg)}
+      {:ok, apply_config_to_opts(opts, apply_env_overrides(cfg))}
     end
   end
 
@@ -34,6 +24,8 @@ defmodule AgentReviews.Config do
     agent_args = System.get_env("AGENT_ARGS")
 
     cfg
+    |> Map.put_new(:agent_cmd, "codex")
+    |> Map.put_new(:agent_args, "")
     |> maybe_put_string(:agent_cmd, agent_cmd)
     |> maybe_put_string(:agent_args, agent_args)
   end
@@ -43,15 +35,6 @@ defmodule AgentReviews.Config do
   defp maybe_put_string(map, k, v) do
     v = String.trim(to_string(v))
     if v == "", do: map, else: Map.put(map, k, v)
-  end
-
-  defp read_many_optional_configs(paths) when is_list(paths) do
-    Enum.reduce_while(paths, {:ok, %{}}, fn path, {:ok, acc} ->
-      case read_optional_config(path) do
-        {:ok, cfg} -> {:cont, {:ok, Map.merge(acc, cfg)}}
-        {:error, msg} -> {:halt, {:error, msg}}
-      end
-    end)
   end
 
   defp read_optional_config(nil), do: {:ok, %{}}
@@ -115,15 +98,8 @@ defmodule AgentReviews.Config do
 
     with {:ok, value} <- parse_toml_value(raw) do
       case key do
-        "agent_cmd" -> {:ok, {:agent_cmd, to_string(value)}}
-        "agent_args" -> {:ok, {:agent_args, to_string(value)}}
         "model" -> {:ok, {:model, to_string(value)}}
         "reasoning_effort" -> {:ok, {:reasoning_effort, to_string(value)}}
-        "full_auto" when is_boolean(value) -> {:ok, {:full_auto, value}}
-        "skip_nitpicks" when is_boolean(value) -> {:ok, {:skip_nitpicks, value}}
-        "auto_commit" when is_boolean(value) -> {:ok, {:auto_commit, value}}
-        "verbose" when is_boolean(value) -> {:ok, {:verbose, value}}
-        "checkout_default" when is_boolean(value) -> {:ok, {:checkout_default, value}}
         _ -> :ignore
       end
     end
@@ -168,16 +144,6 @@ defmodule AgentReviews.Config do
   end
 
   defp apply_config_to_opts(opts, cfg) do
-    opts = Map.put(opts, :full_auto, Map.get(cfg, :full_auto, true))
-    opts = Map.put(opts, :skip_nitpicks, Map.get(cfg, :skip_nitpicks, false))
-
-    checkout_default = Map.get(cfg, :checkout_default, nil)
-
-    opts =
-      if is_boolean(checkout_default),
-        do: Map.put(opts, :checkout_default, checkout_default),
-        else: opts
-
     opts = Map.put(opts, :agent_cmd, Map.get(cfg, :agent_cmd, "codex"))
     opts = Map.put(opts, :agent_args, Map.get(cfg, :agent_args, ""))
 
@@ -190,16 +156,6 @@ defmodule AgentReviews.Config do
       if is_nil(Map.get(opts, :reasoning_effort)),
         do: Map.put(opts, :reasoning_effort, Map.get(cfg, :reasoning_effort, nil)),
         else: opts
-
-    opts =
-      if Map.get(opts, :verbose_overridden?, false),
-        do: opts,
-        else: Map.put(opts, :verbose?, Map.get(cfg, :verbose, false))
-
-    opts =
-      if Map.get(opts, :commit_overridden?, false),
-        do: opts,
-        else: Map.put(opts, :commit?, Map.get(cfg, :auto_commit, false) == true)
 
     opts
   end

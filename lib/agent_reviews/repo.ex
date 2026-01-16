@@ -1,4 +1,6 @@
 defmodule AgentReviews.Repo do
+  @agent_dir ".agent_review"
+
   def git_root(nil), do: git_root(".")
 
   def git_root(path) do
@@ -35,7 +37,7 @@ defmodule AgentReviews.Repo do
             _ -> ""
           end
 
-        needs_agent? = not Regex.match?(~r/^\s*\.agent\/\s*$/m, content)
+        needs_agent? = not Regex.match?(~r/^\s*\.agent_review\/\s*$/m, content)
         needs_worktrees? = not Regex.match?(~r/^\s*\.worktrees\/\s*$/m, content)
 
         if not (needs_agent? or needs_worktrees?) do
@@ -47,7 +49,7 @@ defmodule AgentReviews.Repo do
             [
               if(String.trim(content) == "", do: "", else: "\n"),
               "# agent_reviews (local-only)\n",
-              if(needs_agent?, do: ".agent/\n", else: ""),
+              if(needs_agent?, do: "#{@agent_dir}/\n", else: ""),
               if(needs_worktrees?, do: ".worktrees/\n", else: "")
             ]
             |> IO.iodata_to_binary()
@@ -56,7 +58,7 @@ defmodule AgentReviews.Repo do
 
           added =
             []
-            |> then(fn acc -> if(needs_agent?, do: [".agent/" | acc], else: acc) end)
+            |> then(fn acc -> if(needs_agent?, do: ["#{@agent_dir}/" | acc], else: acc) end)
             |> then(fn acc -> if(needs_worktrees?, do: [".worktrees/" | acc], else: acc) end)
             |> Enum.reverse()
             |> Enum.join(", ")
@@ -76,10 +78,10 @@ defmodule AgentReviews.Repo do
       hint =
         cond do
           is_binary(p) and String.trim(p) != "" ->
-            " Add them manually by appending `.agent/` and `.worktrees/` to #{p}."
+            " Add them manually by appending `#{@agent_dir}/` and `.worktrees/` to #{p}."
 
           true ->
-            " Add them manually by appending `.agent/` and `.worktrees/` to `.git/info/exclude`."
+            " Add them manually by appending `#{@agent_dir}/` and `.worktrees/` to `.git/info/exclude`."
         end
 
       IO.puts(:stderr, "WARN: Could not write repo-local exclude (#{inspect(r)})." <> hint)
@@ -117,176 +119,23 @@ defmodule AgentReviews.Repo do
     end
   end
 
-  # ----- Optional PR checkout (gh pr checkout) + auto-stash -----
+  # ----- PR checkout (gh pr checkout) -----
 
-  def checkout_enabled?(command, opts) do
-    case Map.get(opts, :checkout, :unset) do
-      v when is_boolean(v) ->
-        v
-
-      _ ->
-        command_default =
-          case command do
-            :run -> true
-            :fetch -> false
-            :post -> false
-            _ -> false
-          end
-
-        cfg_default = Map.get(opts, :checkout_default, nil)
-        if is_boolean(cfg_default), do: cfg_default, else: command_default
-    end
-  end
-
-  def with_optional_checkout(root, pr_ref, command, opts, fun) when is_function(fun, 1) do
-    if checkout_enabled?(command, opts) do
-      with {:ok, checkout_ctx} <- checkout_pr_branch(root, pr_ref, opts) do
-        try do
-          fun.(checkout_ctx)
-        after
-          _ = maybe_reapply_stash(root, checkout_ctx)
-        end
-      end
-    else
-      fun.(%{checked_out?: false, stash_ref: nil})
-    end
-  end
-
-  defp checkout_pr_branch(root, pr_ref, opts) do
+  def checkout_pr_branch(root, pr_ref) do
     with :ok <- ensure_gh_authed(),
          {:ok, {_owner, _repo, number}} <- parse_pr_ref(pr_ref, root),
-         {:ok, stash_ref} <- maybe_stash_before_checkout(root, opts),
          {:ok, head_sha} <- gh_pr_head_sha(root, number),
          :ok <- gh_pr_checkout(root, number),
          :ok <- ensure_contains_pr_head_commit(root, "", head_sha),
          {:ok, branch} <- current_branch(root) do
       IO.puts(:stderr, "INFO: Checked out PR #{number} branch: #{branch}")
 
-      if stash_ref do
-        IO.puts(
-          :stderr,
-          "INFO: Stashed changes as #{stash_ref}; will try to re-apply after completion"
-        )
-      end
-
       {:ok,
        %{
-         checked_out?: true,
          pr_number: number,
          branch: branch,
-         head_sha: head_sha,
-         stash_ref: stash_ref
+         head_sha: head_sha
        }}
-    end
-  end
-
-  defp maybe_stash_before_checkout(root, opts) do
-    if working_tree_clean?(root) do
-      {:ok, nil}
-    else
-      pref = Map.get(opts, :stash, :unset)
-
-      cond do
-        pref == true ->
-          do_stash(root, opts)
-
-        pref == false ->
-          {:error,
-           "Working tree has local changes; refusing to checkout PR branch.\n\n" <>
-             "Clean the tree, or re-run with --stash to auto-stash changes."}
-
-        stdin_tty?() and
-            prompt_yes_no("Working tree has changes. Stash them to checkout PR branch? [Y/n] ") ->
-          do_stash(root, opts)
-
-        stdin_tty?() ->
-          {:error,
-           "Working tree has local changes; refusing to checkout PR branch.\n\n" <>
-             "Hint: stash/commit/reset your changes, or re-run with --stash."}
-
-        true ->
-          {:error,
-           "Working tree has local changes, but this command is running non-interactively.\n\n" <>
-             "Re-run with --stash, or clean the tree before running."}
-      end
-    end
-  end
-
-  defp do_stash(root, opts) do
-    msg = Map.get(opts, :stash_message) || "#{AgentReviews.Runtime.invoke_name()} auto-stash"
-
-    {out, status} =
-      System.cmd("git", ["stash", "push", "-u", "-m", msg], cd: root, stderr_to_stdout: true)
-
-    if status != 0 do
-      {:error, "Failed to stash local changes.\n\nOutput:\n#{out}"}
-    else
-      {ref_out, ref_status} =
-        System.cmd("git", ["stash", "list", "-1", "--format=%gd"],
-          cd: root,
-          stderr_to_stdout: true
-        )
-
-      ref = String.trim(ref_out)
-
-      if ref_status == 0 and ref != "" do
-        {:ok, ref}
-      else
-        {:ok, "stash@{0}"}
-      end
-    end
-  end
-
-  defp maybe_reapply_stash(_root, %{stash_ref: nil}), do: :ok
-  defp maybe_reapply_stash(_root, %{stash_ref: ""}), do: :ok
-
-  defp maybe_reapply_stash(root, %{stash_ref: stash_ref}) when is_binary(stash_ref) do
-    {out, status} =
-      System.cmd("git", ["stash", "apply", stash_ref], cd: root, stderr_to_stdout: true)
-
-    if status == 0 do
-      IO.puts(:stderr, "INFO: Re-applied stash successfully (#{stash_ref})")
-      :ok
-    else
-      IO.puts(
-        :stderr,
-        "WARN: Failed to re-apply stash (#{stash_ref}). The stash was NOT dropped."
-      )
-
-      IO.puts(
-        :stderr,
-        "WARN: Resolve manually with: git stash list; git stash apply #{stash_ref}"
-      )
-
-      IO.puts(:stderr, "WARN: Output:\n#{out}")
-      :ok
-    end
-  end
-
-  defp working_tree_clean?(root) do
-    case System.cmd("git", ["status", "--porcelain"], cd: root, stderr_to_stdout: true) do
-      {out, 0} -> String.trim(out) == ""
-      _ -> false
-    end
-  end
-
-  defp stdin_tty? do
-    case System.cmd("sh", ["-c", "test -t 0"], stderr_to_stdout: true) do
-      {_out, 0} -> true
-      _ -> false
-    end
-  end
-
-  defp prompt_yes_no(prompt) when is_binary(prompt) do
-    answer = IO.gets(prompt)
-
-    case answer do
-      nil ->
-        false
-
-      s ->
-        s = s |> String.trim() |> String.downcase()
-        s in ["", "y", "yes"]
     end
   end
 

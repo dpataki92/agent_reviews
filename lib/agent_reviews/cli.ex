@@ -1,5 +1,5 @@
 defmodule AgentReviews.CLI do
-  @agent_dir ".agent"
+  @agent_dir ".agent_review"
 
   def main(argv) when is_list(argv) do
     {opts, argv} = parse_opts(argv)
@@ -30,25 +30,10 @@ defmodule AgentReviews.CLI do
     parse_opts(
       argv,
       %{
-        verbose?: false,
-        verbose_overridden?: false,
         model: nil,
         reasoning_effort: nil,
-        codex_config: [],
-        post_fallback_top_level?: false,
         repo: nil,
         commit?: false,
-        commit_overridden?: false,
-        checkout: :unset,
-        stash: :unset,
-        stash_message: nil,
-        config_paths: [],
-        agent_cmd: nil,
-        agent_args: nil,
-        full_auto: nil,
-        skip_nitpicks: nil,
-        auto_commit: nil,
-        checkout_default: nil,
         worktree?: false,
         worktree_dir: nil
       },
@@ -64,38 +49,11 @@ defmodule AgentReviews.CLI do
   defp parse_opts(["--repo", path | rest], opts, rest_rev),
     do: parse_opts(rest, %{opts | repo: path}, rest_rev)
 
-  defp parse_opts(["--verbose" | rest], opts, rest_rev),
-    do: parse_opts(rest, %{opts | verbose?: true, verbose_overridden?: true}, rest_rev)
-
-  defp parse_opts(["--quiet" | rest], opts, rest_rev),
-    do: parse_opts(rest, %{opts | verbose?: false, verbose_overridden?: true}, rest_rev)
-
   defp parse_opts(["--model", model | rest], opts, rest_rev),
     do: parse_opts(rest, %{opts | model: model}, rest_rev)
 
   defp parse_opts(["--reasoning-effort", effort | rest], opts, rest_rev),
     do: parse_opts(rest, %{opts | reasoning_effort: effort}, rest_rev)
-
-  defp parse_opts(["--codex-config", kv | rest], opts, rest_rev),
-    do: parse_opts(rest, %{opts | codex_config: opts.codex_config ++ [kv]}, rest_rev)
-
-  defp parse_opts(["--fallback-top-level" | rest], opts, rest_rev),
-    do: parse_opts(rest, %{opts | post_fallback_top_level?: true}, rest_rev)
-
-  defp parse_opts(["--checkout" | rest], opts, rest_rev),
-    do: parse_opts(rest, %{opts | checkout: true}, rest_rev)
-
-  defp parse_opts(["--no-checkout" | rest], opts, rest_rev),
-    do: parse_opts(rest, %{opts | checkout: false}, rest_rev)
-
-  defp parse_opts(["--stash" | rest], opts, rest_rev),
-    do: parse_opts(rest, %{opts | stash: true}, rest_rev)
-
-  defp parse_opts(["--no-stash" | rest], opts, rest_rev),
-    do: parse_opts(rest, %{opts | stash: false}, rest_rev)
-
-  defp parse_opts(["--stash-message", msg | rest], opts, rest_rev),
-    do: parse_opts(rest, %{opts | stash_message: msg}, rest_rev)
 
   defp parse_opts(["--worktree" | rest], opts, rest_rev),
     do: parse_opts(rest, %{opts | worktree?: true}, rest_rev)
@@ -103,11 +61,8 @@ defmodule AgentReviews.CLI do
   defp parse_opts(["--worktree-dir", dir | rest], opts, rest_rev),
     do: parse_opts(rest, %{opts | worktree_dir: dir}, rest_rev)
 
-  defp parse_opts(["--config", path | rest], opts, rest_rev),
-    do: parse_opts(rest, %{opts | config_paths: opts.config_paths ++ [path]}, rest_rev)
-
   defp parse_opts(["--commit" | rest], opts, rest_rev),
-    do: parse_opts(rest, %{opts | commit?: true, commit_overridden?: true}, rest_rev)
+    do: parse_opts(rest, %{opts | commit?: true}, rest_rev)
 
   defp parse_opts([other | rest], opts, rest_rev),
     do: parse_opts(rest, opts, [other | rest_rev])
@@ -122,70 +77,62 @@ defmodule AgentReviews.CLI do
         usage(opts.invoke)
         :ok
 
-      ["config"] ->
-        print_config_summary(root, opts)
-        :ok
-
-      ["fetch", pr_ref] ->
-        _ = ensure_repo_local_exclude(root)
-
-        with_optional_checkout(root, pr_ref, :fetch, opts, fn checkout_ctx ->
-          case run_fetch(root, pr_ref) do
-            {:ok, fetch_ctx} ->
-              fetch_ctx = Map.put(fetch_ctx, :checkout_ctx, checkout_ctx)
-              print_fetch_summary(root, fetch_ctx, opts)
-              {:ok, fetch_ctx}
-
-            other ->
-              other
-          end
-        end)
-
-      ["apply"] ->
-        _ = ensure_repo_local_exclude(root)
-
-        case run_apply(root, opts) do
-          {:ok, apply_ctx} ->
-            case maybe_commit(root, apply_ctx.tasks_json, opts) do
-              {:error, msg} ->
-                {:error, msg}
-
-              commit_ctx ->
-                print_apply_summary(root, apply_ctx, commit_ctx, opts)
-                {:ok, apply_ctx}
-            end
-
-          other ->
-            other
-        end
-
       ["run", pr_ref] ->
-        if Map.get(opts, :worktree?, false) do
-          _ = ensure_repo_local_exclude(Map.get(opts, :common_root) || root)
-
-          with {:ok, wt_root} <- ensure_pr_worktree_root(root, pr_ref, opts) do
-            IO.puts(:stderr, "INFO: Using worktree: #{wt_root}")
-            _ = ensure_repo_local_exclude(wt_root)
-            run_in_root(wt_root, pr_ref, opts)
-          end
-        else
-          _ = ensure_repo_local_exclude(root)
-          run_in_root(root, pr_ref, opts)
-        end
+        run_with_worktree_if_enabled(root, pr_ref, opts)
 
       ["post", pr_ref] ->
-        _ = ensure_repo_local_exclude(root)
-
-        with_optional_checkout(root, pr_ref, :post, opts, fn _checkout_ctx ->
+        if Map.get(opts, :worktree?, false) do
+          {:error, "--worktree is only supported for `run` (cd into the worktree and run `post` there)."}
+        else
+          _ = ensure_repo_local_exclude(root)
           case run_post(root, pr_ref, opts) do
             {:ok, post_ctx} ->
               print_post_summary(root, pr_ref, post_ctx, opts)
-              {:ok, post_ctx}
+              :ok
 
             other ->
               other
           end
-        end)
+        end
+
+      [pr_ref] ->
+        run_with_worktree_if_enabled(root, pr_ref, opts)
+
+      [] ->
+        usage(opts.invoke)
+        {:error, "Missing arguments"}
+
+      ["post"] ->
+        usage(opts.invoke)
+        {:error, "Missing PR reference for `post`"}
+
+      ["run"] ->
+        usage(opts.invoke)
+        {:error, "Missing PR reference for `run`"}
+
+      ["help"] ->
+        usage(opts.invoke)
+        :ok
+
+      ["--help"] ->
+        usage(opts.invoke)
+        :ok
+
+      ["-h"] ->
+        usage(opts.invoke)
+        :ok
+
+      ["help", _] ->
+        usage(opts.invoke)
+        :ok
+
+      ["post", _pr_ref | _] ->
+        usage(opts.invoke)
+        {:error, "Invalid arguments"}
+
+      ["run", _pr_ref | _] ->
+        usage(opts.invoke)
+        {:error, "Invalid arguments"}
 
       _ ->
         usage(opts.invoke)
@@ -193,23 +140,52 @@ defmodule AgentReviews.CLI do
     end
   end
 
-  defp run_in_root(root, pr_ref, opts) do
-    with_optional_checkout(root, pr_ref, :run, opts, fn checkout_ctx ->
-      with {:ok, fetch_ctx} <- run_fetch(root, pr_ref),
-           {:ok, apply_ctx} <- run_apply(root, opts),
-           {:ok, run_path} <- write_run_md(root, fetch_ctx) do
-        fetch_ctx = Map.put(fetch_ctx, :checkout_ctx, checkout_ctx)
+  defp run_with_worktree_if_enabled(root, pr_ref, opts) do
+    if Map.get(opts, :worktree?, false) do
+      _ = ensure_repo_local_exclude(Map.get(opts, :common_root) || root)
 
-        case maybe_commit(root, apply_ctx.tasks_json, opts) do
-          {:error, msg} ->
-            {:error, msg}
-
-          commit_ctx ->
-            print_run_summary(root, fetch_ctx, apply_ctx, run_path, commit_ctx, opts)
-            :ok
-        end
+      with {:ok, wt_root} <- ensure_pr_worktree_root(root, pr_ref, opts) do
+        IO.puts(:stderr, "INFO: Using worktree: #{wt_root}")
+        _ = ensure_repo_local_exclude(wt_root)
+        run_in_root(wt_root, pr_ref, opts)
       end
-    end)
+    else
+      _ = ensure_repo_local_exclude(root)
+      run_in_root(root, pr_ref, opts)
+    end
+  end
+
+  defp run_in_root(root, pr_ref, opts) do
+    with :ok <- ensure_clean_working_tree(root),
+         {:ok, _checkout_ctx} <- checkout_pr_branch(root, pr_ref),
+         {:ok, fetch_ctx} <- run_fetch(root, pr_ref),
+         {:ok, apply_ctx} <- run_apply(root, fetch_ctx.tasks_json, opts),
+         commit_ctx <- maybe_commit(root, apply_ctx.tasks_json, opts) do
+      case commit_ctx do
+        {:error, msg} ->
+          {:error, msg}
+
+        _ ->
+          write_review_responses!(
+            root,
+            apply_ctx.tasks_json,
+            apply_ctx.responses_md,
+            apply_ctx.agent_last_message,
+            apply_ctx.changed_files,
+            commit_ctx
+          )
+
+          apply_ctx =
+            Map.put(
+              apply_ctx,
+              :posting_metadata,
+              detect_posting_metadata(root, apply_ctx.responses_md)
+            )
+
+          print_run_summary(root, fetch_ctx, apply_ctx, commit_ctx, opts)
+          :ok
+      end
+    end
   end
 
   defp halt_on_error(:ok), do: :ok
@@ -223,31 +199,18 @@ defmodule AgentReviews.CLI do
   defp usage(invoke) do
     IO.puts(:stderr, """
     Usage:
-      #{invoke} [-C PATH|--repo PATH] [global opts] fetch <pr-number|pr-url|owner/repo#number>
-      #{invoke} [-C PATH|--repo PATH] [global opts] apply [--commit]
-      #{invoke} [-C PATH|--repo PATH] [global opts] run <pr-number|pr-url|owner/repo#number> [--commit]
+      #{invoke} [-C PATH|--repo PATH] [global opts] <pr-number|pr-url|owner/repo#number>
+      #{invoke} [-C PATH|--repo PATH] [global opts] run <pr-number|pr-url|owner/repo#number>
       #{invoke} [-C PATH|--repo PATH] [global opts] post <pr-number|pr-url>
-      #{invoke} [-C PATH|--repo PATH] [global opts] config
 
     Global opts:
       -C, --repo PATH         Target git repo (defaults to current directory).
-      --config PATH           Extra config file to load (repeatable).
-      --verbose / --quiet     Stream full agent output to terminal (also saved in `.agent/codex_exec.log`).
       --model MODEL           Set the Codex model (same as `codex --model`).
       --reasoning-effort LVL  Set `reasoning_effort` via `codex --config` (e.g. low|medium|high).
-      --codex-config key=val  Pass through `codex --config key=value` (repeatable).
-      --commit                After a successful apply/run, create a local git commit (never pushes).
-
-      --checkout / --no-checkout
-                              When enabled, run `gh pr checkout` before the command.
-                              Defaults: run=yes, fetch=no, post=no (override via config `checkout_default`).
-      --stash / --no-stash     If checkout is enabled and the tree is dirty, allow auto-stash.
-      --stash-message MSG      Stash message (default: "#{invoke} auto-stash").
+      --commit                After a successful run, create a local git commit (never pushes).
 
       --worktree              (run only) Run inside a per-PR git worktree under `.worktrees/` (enables parallel PR sessions).
       --worktree-dir DIR      Override worktree base dir (default: `<repo_root>/.worktrees/agent_reviews`).
-
-      --fallback-top-level     If JSON metadata is missing/invalid, allow posting a single top-level comment as fallback (discouraged).
 
     Config files (optional):
       - ~/.agent_reviews.toml
@@ -258,7 +221,7 @@ defmodule AgentReviews.CLI do
       - AGENT_ARGS  Extra args passed to the agent (shellwords)
 
     Notes:
-      - `run` does fetch -> apply -> writes `.agent/run.md` (does not post).
+      - `run` fetches review threads, runs the agent, and writes outputs under `#{@agent_dir}/` in the target repo.
       - `post` is optional and posts per-thread replies when the required JSON metadata block is present.
     """)
   end
@@ -280,63 +243,56 @@ defmodule AgentReviews.CLI do
     agent_args = Map.get(opts, :agent_args, "")
     model = Map.get(opts, :model, nil) || "(default)"
     reasoning = Map.get(opts, :reasoning_effort, nil) || "(default)"
-    full_auto = Map.get(opts, :full_auto, true)
-    skip_nitpicks = Map.get(opts, :skip_nitpicks, false)
-
-    checkout_str =
-      cond do
-        is_boolean(checkout?) -> to_string(checkout?)
-        true -> "(default)"
-      end
 
     args_str =
       if String.trim(to_string(agent_args)) == "", do: "(none)", else: to_string(agent_args)
 
-    "agent_cmd=#{agent}, agent_args=#{args_str}, model=#{model}, reasoning=#{reasoning}, full_auto=#{full_auto}, skip_nitpicks=#{skip_nitpicks}, checkout=#{checkout_str}"
+    _checkout? = checkout?
+
+    "agent_cmd=#{agent}, agent_args=#{args_str}, model=#{model}, reasoning=#{reasoning}"
   end
 
   defp ensure_repo_local_exclude(root), do: AgentReviews.Repo.ensure_repo_local_exclude(root)
 
   defp ensure_gh_authed, do: AgentReviews.Repo.ensure_gh_authed()
 
-  defp checkout_enabled?(command, opts), do: AgentReviews.Repo.checkout_enabled?(command, opts)
-
-  defp with_optional_checkout(root, pr_ref, command, opts, fun) when is_function(fun, 1),
-    do: AgentReviews.Repo.with_optional_checkout(root, pr_ref, command, opts, fun)
+  defp checkout_pr_branch(root, pr_ref), do: AgentReviews.Repo.checkout_pr_branch(root, pr_ref)
 
   defp ensure_pr_worktree_root(root, pr_ref, opts),
     do: AgentReviews.Repo.ensure_pr_worktree_root(root, pr_ref, opts)
 
-  defp print_config_summary(root, opts) do
-    user_cfg = Path.join(System.user_home!(), ".agent_reviews.toml")
-    repo_cfg = Path.join(root, ".agent_reviews.toml")
+  defp ensure_agent_dir(root) do
+    new_dir = Path.join(root, @agent_dir)
+    old_dir = Path.join(root, ".agent")
 
-    IO.puts("\n== #{opts.invoke} config ==")
-    IO.puts("Repo: #{root}")
-    IO.puts("Config files (loaded if present):")
-    IO.puts("  - #{user_cfg}")
-    IO.puts("  - #{repo_cfg}")
+    cond do
+      File.dir?(new_dir) ->
+        :ok
 
-    extra = Map.get(opts, :config_paths, [])
+      File.dir?(old_dir) ->
+        case File.rename(old_dir, new_dir) do
+          :ok ->
+            IO.puts(:stderr, "INFO: Renamed .agent/ -> #{@agent_dir}/")
+            :ok
 
-    if extra != [] do
-      IO.puts("Extra --config files:")
-      Enum.each(extra, fn p -> IO.puts("  - #{Path.expand(to_string(p))}") end)
+          _ ->
+            File.mkdir_p!(new_dir)
+            :ok
+        end
+
+      true ->
+        File.mkdir_p!(new_dir)
+        :ok
     end
-
-    IO.puts("Effective: #{effective_config_summary(opts, Map.get(opts, :checkout_default, nil))}")
-    IO.puts("Status: ✅")
   end
 
   defp run_fetch(root, pr_ref) do
     with :ok <- ensure_gh_authed(),
          {:ok, {owner, repo, number}} <- parse_pr_ref(pr_ref, root),
-         :ok <- File.mkdir_p(Path.join(root, @agent_dir)) do
+         :ok <- ensure_agent_dir(root) do
       agent_dir = Path.join(root, @agent_dir)
-      review_threads_path = Path.join(agent_dir, "review_threads.json")
-      tasks_yaml_path = Path.join(agent_dir, "tasks.yaml")
       tasks_json_path = Path.join(agent_dir, "tasks.json")
-      tasks_md_path = Path.join(agent_dir, "tasks.md")
+      review_threads_path = Path.join(agent_dir, "debug_review_threads.json")
 
       case gh_graphql_pages(owner, repo, number) do
         {:ok,
@@ -349,33 +305,14 @@ defmodule AgentReviews.CLI do
            base_sha: base_sha,
            truncated?: truncated?,
            tasks: tasks,
-           raw_pages: raw_pages
+           raw_pages: _raw_pages
          }} ->
-          File.write!(review_threads_path, raw_pages)
-
-          File.write!(
-            tasks_yaml_path,
-            tasks_yaml(pr_title, pr_url, head_ref, base_ref, head_sha, base_sha, tasks)
-          )
-
           File.write!(
             tasks_json_path,
             tasks_json(pr_title, pr_url, head_ref, base_ref, head_sha, base_sha, tasks)
           )
 
-          File.write!(tasks_md_path, tasks_md(pr_title, pr_url, tasks))
-
-          if truncated? do
-            IO.puts(
-              :stderr,
-              "WARN: reviewThreads truncated (max_pages=#{max_pages()}, page_size=100 → max_threads=#{max_pages() * 100}). Set AGENT_REVIEWS_MAX_PAGES to increase."
-            )
-          end
-
-          IO.puts("Wrote: #{tasks_yaml_path}")
           IO.puts("Wrote: #{tasks_json_path}")
-          IO.puts("Wrote: #{tasks_md_path}")
-          IO.puts("Wrote: #{review_threads_path}")
 
           {:ok,
            %{
@@ -386,12 +323,13 @@ defmodule AgentReviews.CLI do
              head_sha: head_sha,
              base_sha: base_sha,
              truncated?: truncated?,
-             tasks: tasks
+             tasks: tasks,
+             tasks_json: tasks_json_path
            }}
 
         {:error, msg, raw_pages} ->
           File.write!(review_threads_path, raw_pages)
-          IO.puts("Wrote: #{review_threads_path}")
+          IO.puts(:stderr, "Wrote debug: #{review_threads_path}")
           {:error, msg}
 
         {:error, msg} ->
@@ -400,132 +338,86 @@ defmodule AgentReviews.CLI do
     end
   end
 
-  defp run_apply(root, opts) do
-    agent_dir = Path.join(root, @agent_dir)
-    tasks_yaml = Path.join(agent_dir, "tasks.yaml")
-    tasks_json = Path.join(agent_dir, "tasks.json")
+  defp run_apply(root, tasks_json_path, opts) do
+    responses_md = Path.join([root, @agent_dir, "review_responses.md"])
+    debug_log = Path.join([root, @agent_dir, "debug_agent_exec.log"])
 
-    cond do
-      not File.exists?(tasks_yaml) ->
-        {:error, "Missing #{tasks_yaml} (run: #{opts.invoke} fetch <pr>)"}
+    if not File.exists?(tasks_json_path) do
+      {:error, "Missing #{tasks_json_path} (run: #{opts.invoke} <pr>)"}
+    else
+      agent_cmd_in = Map.get(opts, :agent_cmd, "codex")
+      agent_args = shellwords(Map.get(opts, :agent_args, "")) ++ codex_args_from_opts(opts)
+      agent_args = maybe_add_full_auto(agent_args, true)
+      prompt = agent_prompt_template(opts, tasks_json_path, root)
 
-      not File.exists?(tasks_json) ->
-        {:error, "Missing #{tasks_json} (run: #{opts.invoke} fetch <pr>)"}
-
-      true ->
-        prompt_md = Path.join(agent_dir, "codex_prompt.md")
-        responses_raw_md = Path.join(agent_dir, "review_responses.raw.md")
-        responses_md = Path.join(agent_dir, "review_responses.md")
-        exec_log = Path.join(agent_dir, "codex_exec.log")
-        patch_path = Path.join(agent_dir, "changes.patch")
-
-        File.mkdir_p!(agent_dir)
-
-        agent_cmd_in = Map.get(opts, :agent_cmd, "codex")
-        agent_args = shellwords(Map.get(opts, :agent_args, "")) ++ codex_args_from_opts(opts)
-        agent_args = maybe_add_full_auto(agent_args, Map.get(opts, :full_auto, true))
-
-        with :ok <- ensure_clean_working_tree(root),
-             :ok <- ensure_on_recorded_pr_head(root, tasks_json),
-             {:ok, agent_cmd} <- resolve_agent_cmd(agent_cmd_in),
-             :ok <- ensure_agent_noninteractive(agent_cmd) do
-          if agent_cmd != agent_cmd_in do
-            IO.puts(:stderr, "INFO: Using agent executable at #{agent_cmd}")
-          end
-
-          File.write!(prompt_md, agent_prompt_template(opts))
-          IO.puts("Wrote: #{prompt_md}")
-
-          case run_agent(root, agent_cmd, agent_args, prompt_md, responses_raw_md, exec_log, opts) do
-            :ok ->
-              wrap_review_responses!(
-                root,
-                tasks_yaml,
-                tasks_json,
-                responses_raw_md,
-                responses_md,
-                exec_log
-              )
-
-              write_changes_patch!(root, patch_path)
-
-              {:ok,
-               %{
-                 tasks_yaml: tasks_yaml,
-                 tasks_json: tasks_json,
-                 prompt_md: prompt_md,
-                 responses_raw_md: responses_raw_md,
-                 responses_md: responses_md,
-                 exec_log: exec_log,
-                 patch_path: patch_path,
-                 changed_files: changed_files(root),
-                 posting_metadata: detect_posting_metadata(root, responses_md)
-               }}
-
-            other ->
-              other
-          end
-        else
-          {:error, msg} -> {:error, msg}
+      with :ok <- ensure_on_recorded_pr_head(root, tasks_json_path),
+           {:ok, agent_cmd} <- resolve_agent_cmd(agent_cmd_in),
+           :ok <- ensure_agent_noninteractive(agent_cmd) do
+        if agent_cmd != agent_cmd_in do
+          IO.puts(:stderr, "INFO: Using agent executable at #{agent_cmd}")
         end
+
+        case run_agent_capture(root, agent_cmd, agent_args, prompt) do
+          {:ok, %{last_message: last_message}} ->
+            {:ok,
+             %{
+               tasks_json: tasks_json_path,
+               responses_md: responses_md,
+               agent_last_message: last_message,
+               changed_files: changed_files(root)
+             }}
+
+          {:error, %{status: status, output: output, last_message: last_message}} ->
+            File.write!(debug_log, output)
+            IO.puts(:stderr, "Wrote debug: #{debug_log}")
+
+            write_failure_review_responses!(
+              root,
+              tasks_json_path,
+              responses_md,
+              status,
+              output,
+              last_message
+            )
+
+            hint = codex_failure_hint(output)
+            {:error, "Agent exited with status #{status} (see #{responses_md}).#{hint}"}
+        end
+      else
+        {:error, msg} -> {:error, msg}
+      end
     end
   end
 
-  defp run_agent(root, agent_cmd, agent_args, prompt_md, responses_md, exec_log, opts) do
-    label = "Running Codex (logs: #{exec_log})"
+  defp run_agent_capture(root, agent_cmd, agent_args, prompt) do
+    tmp_last = tmp_path("agent_reviews_last_message", ".md")
 
-    status =
-      if opts.verbose? do
-        IO.puts("#{label}...")
+    args =
+      ["exec", "-C", Path.expand(root), "--output-last-message", tmp_last] ++ agent_args ++ ["-"]
 
-        # Stream to terminal and also save to exec_log.
-        bash_args =
-          [
-            "-c",
-            ~S(set -o pipefail; cat "$1" | "$2" exec -C "$3" --output-last-message "$4" "${@:6}" - 2>&1 | tee "$5"),
-            "_",
-            prompt_md,
-            agent_cmd,
-            root,
-            responses_md,
-            exec_log
-          ] ++ agent_args
+    {out, status} =
+      run_with_spinner("Running agent", fn ->
+        System.cmd(agent_cmd, args, cd: root, stderr_to_stdout: true, input: prompt)
+      end)
 
-        {_stream, status} =
-          System.cmd("bash", bash_args, cd: root, into: IO.stream(:stdio, :line))
-
-        status
-      else
-        # Quiet mode: save full output to exec_log only and show a lightweight spinner while Codex runs.
-        bash_args =
-          [
-            "-c",
-            ~S(set -o pipefail; cat "$1" | "$2" exec -C "$3" --output-last-message "$4" "${@:6}" - >"$5" 2>&1),
-            "_",
-            prompt_md,
-            agent_cmd,
-            root,
-            responses_md,
-            exec_log
-          ] ++ agent_args
-
-        {_out, status} =
-          run_with_spinner(label, fn ->
-            System.cmd("bash", bash_args, cd: root, stderr_to_stdout: true)
-          end)
-
-        status
+    last_message =
+      case File.read(tmp_last) do
+        {:ok, s} -> String.trim_trailing(s)
+        _ -> ""
       end
 
-    IO.puts("Wrote: #{responses_md}")
+    _ = File.rm(tmp_last)
 
-    if status != 0 do
-      ensure_failure_details!(responses_md, exec_log)
-      hint = codex_failure_hint(exec_log)
-      {:error, "Codex CLI exited with status #{status} (see #{responses_md}).#{hint}"}
+    if status == 0 do
+      {:ok, %{output: out, last_message: last_message}}
     else
-      :ok
+      {:error, %{status: status, output: out, last_message: last_message}}
     end
+  end
+
+  defp tmp_path(prefix, suffix) do
+    name = "#{prefix}-#{System.unique_integer([:positive])}#{suffix}"
+    Path.join(System.tmp_dir!(), name)
   end
 
   defp run_with_spinner(label, fun) when is_function(fun, 0) do
@@ -574,12 +466,7 @@ defmodule AgentReviews.CLI do
           []
       end
 
-    config_args =
-      opts
-      |> Map.get(:codex_config, [])
-      |> Enum.flat_map(fn kv -> ["--config", kv] end)
-
-    model_args ++ reasoning_args ++ config_args
+    model_args ++ reasoning_args
   end
 
   defp toml_string(value) do
@@ -592,53 +479,8 @@ defmodule AgentReviews.CLI do
     ~s("#{escaped}")
   end
 
-  defp print_fetch_summary(root, fetch_ctx, opts) do
-    agent_dir = Path.join(root, @agent_dir)
-
-    tasks_yaml = display_output_path(Path.join(agent_dir, "tasks.yaml"), root)
-    tasks_json = display_output_path(Path.join(agent_dir, "tasks.json"), root)
-    tasks_md = display_output_path(Path.join(agent_dir, "tasks.md"), root)
-    threads = display_output_path(Path.join(agent_dir, "review_threads.json"), root)
-    invoke = invoke_for_root(opts.invoke, root)
-
-    IO.puts("\n== #{opts.invoke} fetch ==")
-    IO.puts("Repo: #{Path.expand(root)}")
-    IO.puts("PR: #{fetch_ctx.pr_url}")
-    IO.puts("Title: #{fetch_ctx.pr_title}")
-    IO.puts("Effective: #{effective_config_summary(opts, checkout_enabled?(:fetch, opts))}")
-    IO.puts("Tasks: #{format_type_counts(fetch_ctx.tasks)}")
-    IO.puts("Outputs:")
-    IO.puts("  - `#{tasks_yaml}`")
-    IO.puts("  - `#{tasks_json}`")
-    IO.puts("  - `#{tasks_md}`")
-    IO.puts("  - `#{threads}`")
-    IO.puts("Next: `#{invoke} apply` or `#{invoke} run #{fetch_ctx.pr_url}`")
-    IO.puts("Status: ✅ success")
-  end
-
-  defp print_apply_summary(root, apply_ctx, commit_ctx, opts) do
-    responses = display_output_path(apply_ctx.responses_md, root)
-    exec_log = display_output_path(apply_ctx.exec_log, root)
-    patch = display_output_path(apply_ctx.patch_path, root)
-    invoke = invoke_for_root(opts.invoke, root)
-
-    IO.puts("\n== #{opts.invoke} apply ==")
-    IO.puts("Repo: #{Path.expand(root)}")
-    IO.puts("Effective: #{effective_config_summary(opts, false)}")
-    IO.puts("Outputs:")
-    IO.puts("  - `#{responses}`")
-    IO.puts("  - `#{exec_log}`")
-    IO.puts("  - `#{patch}`")
-    IO.puts("Changed files: #{format_changed_files(apply_ctx.changed_files)}")
-    IO.puts("Posting metadata: #{format_posting_metadata(apply_ctx.posting_metadata)}")
-    IO.puts("Commit: #{format_commit(commit_ctx)}")
-    IO.puts("Next: review `#{patch}`, then `#{invoke} post <pr-number|pr-url>` (optional)")
-    IO.puts("Status: ✅ success")
-  end
-
-  defp print_run_summary(root, fetch_ctx, apply_ctx, run_path, commit_ctx, opts) do
-    run_rel = display_output_path(run_path, root)
-    patch = display_output_path(apply_ctx.patch_path, root)
+  defp print_run_summary(root, fetch_ctx, apply_ctx, commit_ctx, opts) do
+    tasks_json = display_output_path(apply_ctx.tasks_json, root)
     responses = display_output_path(apply_ctx.responses_md, root)
     invoke = invoke_for_root(opts.invoke, root)
 
@@ -646,12 +488,11 @@ defmodule AgentReviews.CLI do
     IO.puts("Repo: #{Path.expand(root)}")
     IO.puts("PR: #{fetch_ctx.pr_url}")
     IO.puts("Title: #{fetch_ctx.pr_title}")
-    IO.puts("Effective: #{effective_config_summary(opts, checkout_enabled?(:run, opts))}")
+    IO.puts("Effective: #{effective_config_summary(opts, nil)}")
     IO.puts("Tasks: #{format_type_counts(fetch_ctx.tasks)}")
     IO.puts("Outputs:")
     IO.puts("  - `#{responses}`")
-    IO.puts("  - `#{run_rel}`")
-    IO.puts("  - `#{patch}`")
+    IO.puts("  - `#{tasks_json}`")
     IO.puts("Changed files: #{format_changed_files(apply_ctx.changed_files)}")
     IO.puts("Posting metadata: #{format_posting_metadata(apply_ctx.posting_metadata)}")
     IO.puts("Commit: #{format_commit(commit_ctx)}")
@@ -665,7 +506,7 @@ defmodule AgentReviews.CLI do
     IO.puts("\n== #{opts.invoke} post ==")
     IO.puts("Repo: #{Path.expand(root)}")
     IO.puts("PR: #{pr_ref}")
-    IO.puts("Effective: #{effective_config_summary(opts, checkout_enabled?(:post, opts))}")
+    IO.puts("Effective: #{effective_config_summary(opts, nil)}")
     IO.puts("Thread replies posted: #{post_ctx.posted_replies}")
     IO.puts("Top-level comment posted: #{if(post_ctx.top_level_posted?, do: "yes", else: "no")}")
     IO.puts("Next: `#{invoke} run <pr-number|pr-url>` (optional)")
@@ -831,35 +672,17 @@ defmodule AgentReviews.CLI do
     |> Enum.map(&Path.join(&1, "codex"))
   end
 
-  defp ensure_failure_details!(responses_md, exec_log) do
-    responses_empty? =
-      case File.read(responses_md) do
-        {:ok, content} -> String.trim(content) == ""
-        _ -> true
-      end
+  defp codex_failure_hint(output) when is_binary(output) do
+    cond do
+      String.contains?(output, "stdin is not a terminal") ->
+        "\nHint: your Codex invocation is running in interactive mode; ensure `codex exec` is available and being used."
 
-    if responses_empty? and File.exists?(exec_log) do
-      File.cp!(exec_log, responses_md)
-    end
-  end
+      String.contains?(output, "Codex cannot access session files") or
+          (String.contains?(output, "permission denied") and
+             String.contains?(output, ".codex/sessions")) ->
+        "\nHint: Codex cannot write to `~/.codex/sessions`. Fix ownership/permissions of `~/.codex` (Codex often suggests: `sudo chown -R $(whoami) ~/.codex`)."
 
-  defp codex_failure_hint(exec_log) do
-    case File.read(exec_log) do
-      {:ok, log} ->
-        cond do
-          String.contains?(log, "stdin is not a terminal") ->
-            "\nHint: your Codex invocation is running in interactive mode; ensure `codex exec` is available and being used."
-
-          String.contains?(log, "Codex cannot access session files") or
-              (String.contains?(log, "permission denied") and
-                 String.contains?(log, ".codex/sessions")) ->
-            "\nHint: Codex cannot write to `~/.codex/sessions`. Fix ownership/permissions of `~/.codex` (Codex often suggests: `sudo chown -R $(whoami) ~/.codex`)."
-
-          true ->
-            ""
-        end
-
-      _ ->
+      true ->
         ""
     end
   end
@@ -891,10 +714,10 @@ defmodule AgentReviews.CLI do
 
       cond do
         not File.exists?(responses) ->
-          {:error, "Missing #{responses} (run: #{opts.invoke} apply)"}
+          {:error, "Missing #{responses} (run: #{opts.invoke} <pr>)"}
 
         not File.exists?(tasks_json) ->
-          {:error, "Missing #{tasks_json} (run: #{opts.invoke} fetch <pr>)"}
+          {:error, "Missing #{tasks_json} (run: #{opts.invoke} <pr>)"}
 
         File.read!(responses) |> String.trim() == "" ->
           {:error, "#{responses} is empty"}
@@ -932,26 +755,7 @@ defmodule AgentReviews.CLI do
               end
 
             {:error, reason} ->
-              if opts.post_fallback_top_level? do
-                IO.puts(
-                  :stderr,
-                  "WARN: #{reason}; falling back to posting a single consolidated comment."
-                )
-
-                {out, status} =
-                  System.cmd("gh", ["pr", "comment", pr_ref, "--body-file", responses],
-                    stderr_to_stdout: true
-                  )
-
-                if status != 0 do
-                  {:error, "Failed to post PR comment.\n\nOutput:\n#{out}"}
-                else
-                  {:ok, %{posted_replies: 0, top_level_posted?: true}}
-                end
-              else
-                {:error,
-                 "#{reason}\n\nRefusing to post a consolidated top-level comment by default.\nIf you really want that fallback, re-run with: #{opts.invoke} --fallback-top-level post #{pr_ref}"}
-              end
+              {:error, reason}
           end
       end
     else
@@ -1061,7 +865,7 @@ defmodule AgentReviews.CLI do
         else
           _ ->
             {:error,
-             "Malformed GitHub API response while extracting task fields (see .agent/review_threads.json for debugging).",
+             "Malformed GitHub API response while extracting task fields (see #{@agent_dir}/debug_review_threads.json for debugging).",
              json_array(raw_pages_acc)}
         end
 
@@ -1391,18 +1195,6 @@ defmodule AgentReviews.CLI do
     end
   end
 
-  defp tasks_yaml(pr_title, pr_url, head_ref, base_ref, head_sha, base_sha, tasks),
-    do:
-      AgentReviews.Tasks.tasks_yaml(
-        pr_title,
-        pr_url,
-        head_ref,
-        base_ref,
-        head_sha,
-        base_sha,
-        tasks
-      )
-
   defp tasks_json(pr_title, pr_url, head_ref, base_ref, head_sha, base_sha, tasks) do
     doc = %{
       "pr_title" => pr_title,
@@ -1461,15 +1253,15 @@ defmodule AgentReviews.CLI do
     end)
   end
 
-  defp tasks_md(pr_title, pr_url, tasks), do: AgentReviews.Tasks.tasks_md(pr_title, pr_url, tasks)
-
   defp thread_suffix(thread_id), do: AgentReviews.Tasks.thread_suffix(thread_id)
 
-  defp agent_prompt_template(opts) do
+  defp agent_prompt_template(_opts, tasks_json_path, root) do
+    tasks_rel = Path.relative_to(tasks_json_path, root)
+
     """
     # PR Review Implementation Task
 
-    Read `.agent/tasks.yaml` and implement/respond to each task systematically.
+    Read `#{tasks_rel}` and implement/respond to each task systematically.
 
     ## Decision Framework
     For each task, choose ONE action:
@@ -1488,12 +1280,7 @@ defmodule AgentReviews.CLI do
     - NO commits or pushes
     ## Output Requirements (important)
 
-    # Preferences
-    - skip_nitpicks: #{if(Map.get(opts, :skip_nitpicks, false), do: "true", else: "false")}
-
-    If `skip_nitpicks` is true, then for tasks with type `"nit"` you should default to **PUSHBACK** with a short acknowledgement (do not spend time implementing nits unless they are correctness/security issues).
-
-    - You MUST list **all** tasks from `.agent/tasks.yaml` in order (Task 1..N).
+    - You MUST list **all** tasks from `#{tasks_rel}` in order (Task 1..N).
     - For each task, include a short excerpt of the original ask so a developer can understand the request without opening GitHub.
     - For **ACCEPT** decisions: be concise (what changed + which files).
     - For **ANSWER** and **PUSHBACK** decisions: be more verbose with reasoning, and include small examples/snippets when helpful. The response should be copy-paste ready for GitHub.
@@ -1533,78 +1320,11 @@ defmodule AgentReviews.CLI do
 
     Rules:
     - Include a `replies[]` entry for each task you **ANSWER** or **PUSHBACK** (one per task).
-    - `thread_id` must come from `.agent/tasks.yaml` for that task.
+    - `thread_id` must come from `#{tasks_rel}` for that task.
     - `decision` must be `ANSWER` or `PUSHBACK`.
     - `top_level_comment` may be an empty string if you don't want a top-level PR comment.
     - The JSON block must be the final fenced ```json block at the end of the file (no other JSON blocks after it).
     """
-  end
-
-  defp write_run_md(root, fetch_ctx) do
-    agent_dir = Path.join(root, @agent_dir)
-    File.mkdir_p!(agent_dir)
-
-    type_counts =
-      fetch_ctx.tasks
-      |> Enum.map(& &1.type)
-      |> Enum.frequencies()
-      |> Enum.sort_by(fn {type, _} -> type end)
-
-    changed_files = changed_files(root)
-
-    now =
-      DateTime.utc_now()
-      |> DateTime.to_iso8601()
-
-    tasks_yaml = Path.join(agent_dir, "tasks.yaml") |> Path.relative_to(root)
-    tasks_md = Path.join(agent_dir, "tasks.md") |> Path.relative_to(root)
-    responses_md = Path.join(agent_dir, "review_responses.md") |> Path.relative_to(root)
-
-    content =
-      [
-        "# Codex Reviews Run\n",
-        "\n",
-        "- Timestamp (UTC): ",
-        now,
-        "\n",
-        "- PR: ",
-        fetch_ctx.pr_url,
-        "\n",
-        "- Title: ",
-        fetch_ctx.pr_title,
-        "\n",
-        "\n",
-        "## Tasks\n",
-        "- Total: ",
-        Integer.to_string(length(fetch_ctx.tasks)),
-        "\n",
-        Enum.map(type_counts, fn {type, count} ->
-          ["- ", type, ": ", Integer.to_string(count), "\n"]
-        end),
-        "\n",
-        "## Outputs\n",
-        "- `",
-        tasks_yaml,
-        "`\n",
-        "- `",
-        tasks_md,
-        "`\n",
-        "- `",
-        responses_md,
-        "`\n",
-        "\n",
-        "## Working Tree\n",
-        if(changed_files == [],
-          do: "_No local changes detected._\n",
-          else: Enum.map(changed_files, fn f -> ["- `", f, "`\n"] end)
-        )
-      ]
-      |> IO.iodata_to_binary()
-
-    run_path = Path.join(agent_dir, "run.md")
-    File.write!(run_path, content)
-    IO.puts("Wrote: #{run_path}")
-    {:ok, run_path}
   end
 
   defp changed_files(root) do
@@ -1622,37 +1342,6 @@ defmodule AgentReviews.CLI do
     case System.cmd("git", args, cd: root, stderr_to_stdout: true) do
       {out, 0} -> String.split(out, "\n", trim: true)
       _ -> []
-    end
-  end
-
-  defp write_changes_patch!(root, patch_path) do
-    staged = git_out(root, ["diff", "--cached"])
-    unstaged = git_out(root, ["diff"])
-
-    content =
-      cond do
-        String.trim(staged) == "" and String.trim(unstaged) == "" ->
-          "No changes.\n"
-
-        true ->
-          [
-            "# Staged changes (git diff --cached)\n",
-            if(String.trim(staged) == "", do: "(none)\n\n", else: staged <> "\n\n"),
-            "# Unstaged changes (git diff)\n",
-            if(String.trim(unstaged) == "", do: "(none)\n", else: unstaged <> "\n")
-          ]
-          |> IO.iodata_to_binary()
-      end
-
-    File.write!(patch_path, content)
-    IO.puts("Wrote: #{patch_path}")
-    :ok
-  end
-
-  defp git_out(root, args) do
-    case System.cmd("git", args, cd: root, stderr_to_stdout: true) do
-      {out, 0} -> out
-      {out, _} -> out
     end
   end
 
@@ -1819,10 +1508,10 @@ defmodule AgentReviews.CLI do
       _ ->
         if Regex.match?(~r/```[ \t]*(json|jsonc)[ \t]*\r?\n/si, content) do
           {:error,
-           "Found a JSON code block, but posting metadata must be the FINAL fenced ```json block at the end of `.agent/review_responses.md`."}
+           "Found a JSON code block, but posting metadata must be the FINAL fenced ```json block at the end of `#{@agent_dir}/review_responses.md`."}
         else
           {:error,
-           "Could not find a JSON posting metadata code block (```json ... ```) in `.agent/review_responses.md`."}
+           "Could not find a JSON posting metadata code block (```json ... ```) in `#{@agent_dir}/review_responses.md`."}
         end
     end
   end
@@ -1847,13 +1536,8 @@ defmodule AgentReviews.CLI do
   end
 
   defp post_thread_replies(root, replies, task_map) do
-    agent_dir = Path.join(root, @agent_dir)
-    File.mkdir_p!(agent_dir)
-    errors_log = Path.join(agent_dir, "post_errors.log")
-    File.write!(errors_log, "")
-
-    {posted, failed} =
-      Enum.reduce(replies, {0, 0}, fn reply, {posted, failed} ->
+    {posted, failed, errors_log} =
+      Enum.reduce(replies, {0, 0, nil}, fn reply, {posted, failed, errors_log} ->
         with {:ok, decision} <- fetch_string(reply, "decision"),
              true <- decision in ["ANSWER", "PUSHBACK"],
              {:ok, task_id} <- fetch_int(reply, "task_id"),
@@ -1864,9 +1548,10 @@ defmodule AgentReviews.CLI do
              true <- body_trim != "" do
           case post_thread_reply(root, thread_id, body_trim) do
             :ok ->
-              {posted + 1, failed}
+              {posted + 1, failed, errors_log}
 
             {:error, out} ->
+              errors_log = errors_log || Path.join([root, @agent_dir, "post_errors.log"])
               append_post_error!(errors_log, "task_id=#{task_id} thread_id=#{thread_id}", out)
 
               IO.puts(
@@ -1874,7 +1559,7 @@ defmodule AgentReviews.CLI do
                 "ERROR: Failed to post reply for task_id=#{task_id} (see #{errors_log})."
               )
 
-              {posted, failed + 1}
+              {posted, failed + 1, errors_log}
           end
         else
           {:ok, decision} ->
@@ -1883,21 +1568,23 @@ defmodule AgentReviews.CLI do
               "WARN: Skipping reply with decision=#{inspect(decision)} (only ANSWER/PUSHBACK are posted)."
             )
 
-            {posted, failed}
+            {posted, failed, errors_log}
 
           {:error, msg} ->
             IO.puts(:stderr, "WARN: Skipping malformed reply entry: #{msg}")
-            {posted, failed}
+            {posted, failed, errors_log}
 
           false ->
             IO.puts(:stderr, "WARN: Skipping malformed reply entry.")
-            {posted, failed}
+            {posted, failed, errors_log}
         end
       end)
 
     if failed == 0 do
       {:ok, posted}
     else
+      errors_log = errors_log || Path.join([root, @agent_dir, "post_errors.log"])
+
       {:error,
        "Some thread replies failed to post (posted=#{posted}, failed=#{failed}).\nSee: #{errors_log}\n\nCommon causes: missing permissions (fork PR), GitHub auth scope, or rate limits."}
     end
@@ -1920,14 +1607,14 @@ defmodule AgentReviews.CLI do
   defp validate_reply_target(task_map, task_id, thread_id) do
     case Map.get(task_map, task_id) do
       nil ->
-        {:error, "Unknown task_id=#{task_id} (not found in .agent/tasks.json)"}
+        {:error, "Unknown task_id=#{task_id} (not found in #{@agent_dir}/tasks.json)"}
 
       ^thread_id ->
         :ok
 
       other ->
         {:error,
-         "thread_id mismatch for task_id=#{task_id}: metadata has #{inspect(thread_id)}, but .agent/tasks.json has #{inspect(other)}"}
+         "thread_id mismatch for task_id=#{task_id}: metadata has #{inspect(thread_id)}, but #{@agent_dir}/tasks.json has #{inspect(other)}"}
     end
   end
 
@@ -1952,25 +1639,42 @@ defmodule AgentReviews.CLI do
     end
   end
 
-  defp wrap_review_responses!(
+  defp write_review_responses!(
          root,
-         tasks_yaml,
-         tasks_json,
-         responses_raw_md,
+         tasks_json_path,
          responses_md,
-         exec_log
+         agent_last_message,
+         changed_files,
+         commit_ctx
        ) do
-    raw =
-      case File.read(responses_raw_md) do
-        {:ok, s} -> String.trim_trailing(s) <> "\n"
-        _ -> ""
-      end
+    tasks_rel = Path.relative_to(tasks_json_path, root)
+    tasks = tasks_list_for_wrapper(tasks_json_path)
 
-    tasks = tasks_list_for_wrapper(tasks_json)
+    {pr_title, pr_url} =
+      case read_tasks_json(tasks_json_path) do
+        {:ok, decoded} ->
+          {Map.get(decoded, "pr_title", "") |> to_string(), Map.get(decoded, "pr_url", "") |> to_string()}
+
+        _ ->
+          {"", ""}
+      end
 
     now =
       DateTime.utc_now()
       |> DateTime.to_iso8601()
+
+    changed =
+      if changed_files == [] do
+        "_No local changes detected._\n"
+      else
+        changed_files |> Enum.map(fn f -> "- `#{f}`\n" end) |> IO.iodata_to_binary()
+      end
+
+    raw =
+      agent_last_message
+      |> to_string()
+      |> String.trim_trailing()
+      |> Kernel.<>("\n")
 
     header =
       [
@@ -1979,28 +1683,87 @@ defmodule AgentReviews.CLI do
         "- Timestamp (UTC): ",
         now,
         "\n",
+        if(pr_url != "", do: ["- PR: ", pr_url, "\n"], else: []),
+        if(pr_title != "", do: ["- Title: ", pr_title, "\n"], else: []),
         "- Tasks: `",
-        Path.relative_to(tasks_yaml, root),
+        tasks_rel,
         "`\n",
-        "- Raw: `",
-        Path.relative_to(responses_raw_md, root),
-        "`\n",
-        "- Logs: `",
-        Path.relative_to(exec_log, root),
-        "`\n",
+        "- Commit: ",
+        format_commit(commit_ctx),
+        "\n",
         "\n",
         "## Task List\n",
         tasks,
         "\n",
+        "## Working Tree\n",
+        changed,
+        "\n",
         "---\n",
         "\n",
-        "## Codex Output (Last Message)\n",
+        "## Agent Output (Last Message)\n",
         "\n"
       ]
       |> IO.iodata_to_binary()
 
     File.write!(responses_md, header <> raw)
     IO.puts("Wrote: #{responses_md}")
+    :ok
+  end
+
+  defp write_failure_review_responses!(
+         root,
+         tasks_json_path,
+         responses_md,
+         status,
+         _output,
+         last_message
+       ) do
+    tasks_rel = Path.relative_to(tasks_json_path, root)
+    tasks = tasks_list_for_wrapper(tasks_json_path)
+    debug_log = Path.relative_to(Path.join([root, @agent_dir, "debug_agent_exec.log"]), root)
+
+    now =
+      DateTime.utc_now()
+      |> DateTime.to_iso8601()
+
+    last =
+      last_message
+      |> to_string()
+      |> String.trim_trailing()
+
+    header =
+      [
+        "# PR Review Responses (FAILED)\n",
+        "\n",
+        "- Timestamp (UTC): ",
+        now,
+        "\n",
+        "- Tasks: `",
+        tasks_rel,
+        "`\n",
+        "- Agent exit status: ",
+        to_string(status),
+        "\n",
+        "- Debug: `",
+        debug_log,
+        "`\n",
+        "\n",
+        "## Task List\n",
+        tasks,
+        "\n"
+      ]
+      |> IO.iodata_to_binary()
+
+    body =
+      if String.trim(last) == "" do
+        "\n## Agent Last Message\n\n_(empty)_\n"
+      else
+        "\n## Agent Last Message\n\n" <> last <> "\n"
+      end
+
+    File.write!(responses_md, header <> body)
+    IO.puts("Wrote: #{responses_md}")
+    :ok
   end
 
   defp tasks_list_for_wrapper(tasks_json_path) do
@@ -2099,6 +1862,7 @@ defmodule AgentReviews.CLI do
   defp wrapper_excerpt(_), do: "(no content)"
 
   defp append_post_error!(errors_log, label, out) do
+    File.mkdir_p!(Path.dirname(errors_log))
     header = "\n---\n#{label}\n---\n"
     File.write!(errors_log, header <> out <> "\n", [:append])
   end
@@ -2112,29 +1876,23 @@ defmodule AgentReviews.CLI do
     }
     """
 
-    agent_dir = Path.join(root, @agent_dir)
-    File.mkdir_p!(agent_dir)
-    body_path = Path.join(agent_dir, "thread_reply_body.md")
-    File.write!(body_path, body)
+    with_temp_file("agent_reviews_thread_reply", ".md", body, fn body_path ->
+      args = [
+        "api",
+        "graphql",
+        "-f",
+        "query=#{query}",
+        "-f",
+        "id=#{thread_id}",
+        "-F",
+        "body=@#{body_path}"
+      ]
 
-    args = [
-      "api",
-      "graphql",
-      "-f",
-      "query=#{query}",
-      "-f",
-      "id=#{thread_id}",
-      "-F",
-      "body=@#{body_path}"
-    ]
-
-    case System.cmd("gh", args, stderr_to_stdout: true) do
-      {_out, 0} ->
-        :ok
-
-      {out, _} ->
-        {:error, out}
-    end
+      case System.cmd("gh", args, cd: root, stderr_to_stdout: true) do
+        {_out, 0} -> :ok
+        {out, _} -> {:error, out}
+      end
+    end)
   end
 
   defp maybe_post_top_level_comment(root, pr_ref, top_level_comment)
@@ -2142,19 +1900,28 @@ defmodule AgentReviews.CLI do
     if String.trim(top_level_comment) == "" do
       :ok
     else
-      agent_dir = Path.join(root, @agent_dir)
-      File.mkdir_p!(agent_dir)
-      path = Path.join(agent_dir, "top_level_comment.md")
-      File.write!(path, top_level_comment)
-
-      case System.cmd("gh", ["pr", "comment", pr_ref, "--body-file", path],
-             stderr_to_stdout: true
-           ) do
-        {_out, 0} -> :ok
-        {out, _} -> {:error, "Failed to post top-level PR comment.\n\nOutput:\n#{out}"}
-      end
+      with_temp_file("agent_reviews_top_level_comment", ".md", top_level_comment, fn path ->
+        case System.cmd("gh", ["pr", "comment", pr_ref, "--body-file", path],
+               cd: root,
+               stderr_to_stdout: true
+             ) do
+          {_out, 0} -> :ok
+          {out, _} -> {:error, "Failed to post top-level PR comment.\n\nOutput:\n#{out}"}
+        end
+      end)
     end
   end
 
   defp maybe_post_top_level_comment(_root, _pr_ref, _), do: :ok
+
+  defp with_temp_file(prefix, suffix, content, fun) when is_function(fun, 1) do
+    path = tmp_path(prefix, suffix)
+    File.write!(path, content)
+
+    try do
+      fun.(path)
+    after
+      _ = File.rm(path)
+    end
+  end
 end

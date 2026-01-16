@@ -1,6 +1,6 @@
 # agent-reviews
 
-Local tool to turn unresolved GitHub PR review threads into actionable tasks for Codex CLI, apply them, and optionally post per-thread replies.
+Local tool to turn unresolved GitHub PR review threads into actionable tasks, run an agent (default: Codex CLI) to implement/respond, and optionally post per-thread replies.
 
 ## Install
 
@@ -29,27 +29,29 @@ First run (once, in this repo):
 
 Run inside a target repo, or point at one:
 
-- `agent_reviews fetch <pr-number|pr-url|owner/repo#number>`
-- `agent_reviews apply [--commit]`
+- `agent_reviews <pr-number|pr-url|owner/repo#number> [--commit]` (shorthand for `run`)
 - `agent_reviews run <pr-number|pr-url|owner/repo#number> [--commit]`
-- `agent_reviews post <pr-number|pr-url> [--fallback-top-level]`
-- `agent_reviews config`
+- `agent_reviews post <pr-number|pr-url>`
 
 Target a repo explicitly:
 
 - `agent_reviews -C /path/to/repo run 12345`
 
-Outputs are written under the target repo’s `.agent/` directory.
+Outputs are written under the target repo’s `.agent_review/` directory:
+
+- `tasks.json`
+- `review_responses.md` (main user document)
+
+Debug artifacts are only written on failures (e.g. agent logs, raw GitHub API pages).
 
 ## Checkout behavior
 
-- `run` auto-checks out the PR branch by default via `gh pr checkout`.
-- Use `--no-checkout` to disable, or `--checkout` to enable it for `fetch`/`post`.
-- If the working tree is dirty and checkout is enabled, the tool will prompt to stash (TTY) or you can pass `--stash`.
+- `run` auto-checks out the PR branch via `gh pr checkout`.
+- If the working tree is dirty, it refuses to start (clean it up first: commit/stash/reset).
 
 ## Parallel PR sessions (worktrees)
 
-If you want to work on multiple PRs concurrently without `.agent/` conflicts, use git worktrees:
+If you want to work on multiple PRs concurrently without `.agent_review/` conflicts, use git worktrees:
 
 - `agent_reviews run 123 --worktree`
 
@@ -61,47 +63,35 @@ Optional config files (simple TOML subset):
 
 - User: `~/.agent_reviews.toml`
 - Repo: `<repo_root>/.agent_reviews.toml`
-- Extra: `--config /path/to/file.toml` (repeatable; later files win)
 
 Supported keys:
 
-- `agent_cmd` (string, default: "codex")
-- `agent_args` (string, shellwords)
 - `model` (string)
 - `reasoning_effort` (string)
-- `full_auto` (bool, default: true)
-- `skip_nitpicks` (bool, default: false)
-- `auto_commit` (bool, default: false)
-- `verbose` (bool, default: false)
-- `checkout_default` (bool, optional)
 
 Example:
 
 ```toml
 model = "gpt-5.2"
 reasoning_effort = "high"
-skip_nitpicks = true
-checkout_default = true
 ```
 
-You can also use env vars:
+Escape hatch (env vars):
 
 - `AGENT_CMD`
 - `AGENT_ARGS`
 
-Run `agent_reviews config` to see effective settings.
-
 ## Notes
 
-- `apply` requires a clean working tree and validates your current HEAD contains the PR head commit recorded in `.agent/tasks.json` (branch-name mismatch is a warning).
-- Posting expects a final fenced ```json block at the end of `.agent/review_responses.md`.
+- `run` requires a clean working tree and validates your current HEAD contains the PR head commit recorded in `.agent_review/tasks.json` (branch-name mismatch is a warning).
+- Posting expects a final fenced ```json block at the end of `.agent_review/review_responses.md`.
 
 ## Local-only ignore for artifacts
 
-This tool writes runtime artifacts under `.agent/` in the target repo.
+This tool writes runtime artifacts under `.agent_review/` in the target repo.
 
-On `fetch`/`apply`/`run`/`post`, it attempts to add `.agent/` and `.worktrees/` to the repo-local exclude file (not committed): `.git/info/exclude`.
+On `run`/`post`, it attempts to add `.agent_review/` and `.worktrees/` to the repo-local exclude file (not committed): `.git/info/exclude`.
 
 If that fails (permissions/worktrees), add it manually:
 
-- `EXCLUDE=$(git rev-parse --git-path info/exclude) && printf '\n# agent_reviews (local-only)\n.agent/\n.worktrees/\n' >> "$EXCLUDE"`
+- `EXCLUDE=$(git rev-parse --git-path info/exclude) && printf '\n# agent_reviews (local-only)\n.agent_review/\n.worktrees/\n' >> "$EXCLUDE"`
