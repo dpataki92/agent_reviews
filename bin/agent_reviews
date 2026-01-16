@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_bin_dir() {
+  local src="${BASH_SOURCE[0]}"
+
+  while [[ -L "$src" ]]; do
+    local dir
+    dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+
+  cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd
+}
+
+BIN_DIR="$(resolve_bin_dir)"
+TOOL_DIR="$(cd "$BIN_DIR/.." >/dev/null 2>&1 && pwd)"
+SCRIPT="$TOOL_DIR/scripts/codex_reviews.exs"
+
+if [[ ! -f "$SCRIPT" ]]; then
+  echo "ERROR: Missing $SCRIPT" >&2
+  exit 1
+fi
+
+# Used by the Elixir script to print the correct command name in summaries.
+export CODEX_REVIEWS_INVOKE="${CODEX_REVIEWS_INVOKE:-$(basename "$0")}" 
+
+# Prefer Homebrew Elixir if present.
+ELIXIR_BIN=""
+if [[ -x /opt/homebrew/bin/elixir ]]; then
+  ELIXIR_BIN="/opt/homebrew/bin/elixir"
+elif [[ -x /usr/local/bin/elixir ]]; then
+  ELIXIR_BIN="/usr/local/bin/elixir"
+elif command -v elixir >/dev/null 2>&1; then
+  ELIXIR_BIN="$(command -v elixir)"
+fi
+
+if [[ -z "$ELIXIR_BIN" ]]; then
+  echo "ERROR: Missing dependency: 'elixir' (expected on PATH)." >&2
+  echo "Hint: install Elixir (Homebrew or asdf)." >&2
+  exit 1
+fi
+
+if [[ "$ELIXIR_BIN" == "/opt/homebrew/bin/elixir" ]]; then
+  # Ensure Homebrew Elixir runs with Homebrew Erlang (avoid asdf-shim OTP mismatches).
+  export PATH="/opt/homebrew/bin:/opt/homebrew/opt/erlang/bin:${PATH}"
+fi
+
+exec "$ELIXIR_BIN" "$SCRIPT" "$@"
