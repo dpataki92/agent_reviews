@@ -351,7 +351,9 @@ defmodule AgentReviews.CLI do
     end
   end
 
-  defp state_root(_opts, root), do: root
+  defp state_root(opts, root) do
+    Map.get(opts, :common_root) || root
+  end
 
   defp pr_state_path(state_root, pr_number) when is_integer(pr_number) do
     Path.join([state_root, @agent_dir, "state", "pr-#{pr_number}.json"])
@@ -1912,7 +1914,7 @@ defmodule AgentReviews.CLI do
 
   defp thread_suffix(thread_id), do: AgentReviews.Tasks.thread_suffix(thread_id)
 
-  defp agent_prompt_template(_opts, tasks_json_path, root) do
+  defp agent_prompt_template(opts, tasks_json_path, root) do
     tasks_abs = Path.expand(tasks_json_path)
     root_abs = Path.expand(root)
 
@@ -1923,10 +1925,19 @@ defmodule AgentReviews.CLI do
         tasks_abs
       end
 
+    common_root = Map.get(opts, :common_root, nil)
+    {guidelines_path, guidelines_md} = load_guidelines(root, common_root)
+    {always_read_path, always_read} = load_always_read_paths(root, common_root)
+
+    guidance_section =
+      build_guidance_section(guidelines_path, guidelines_md, always_read_path, always_read)
+
     """
     # PR Review Implementation Task
 
     Read `#{tasks_ref}` and implement/respond to each task systematically.
+
+    #{guidance_section}
 
     ## Decision Framework
     For each task, choose ONE action:
@@ -1990,6 +2001,125 @@ defmodule AgentReviews.CLI do
     - `top_level_comment` may be an empty string if you don't want a top-level PR comment.
     - The JSON block must be the final fenced ```json block at the end of the file (no other JSON blocks after it).
     """
+  end
+
+  defp load_guidelines(root, common_root) do
+    candidates =
+      [root, common_root]
+      |> Enum.map(fn
+        nil -> nil
+        p -> Path.join(p, ".agent_reviews_guidelines.md")
+      end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    Enum.find_value(candidates, {nil, nil}, fn path ->
+      if File.regular?(path) and File.exists?(path) do
+        case File.read(path) do
+          {:ok, content} ->
+            content = String.trim_trailing(content)
+
+            max_chars = 24_000
+
+            content =
+              if String.length(content) > max_chars do
+                String.slice(content, 0, max_chars) <> "\n\n_(truncated)_"
+              else
+                content
+              end
+
+            {path, content}
+
+          _ ->
+            nil
+        end
+      end
+    end)
+  end
+
+  defp load_always_read_paths(root, common_root) do
+    candidates =
+      [root, common_root]
+      |> Enum.map(fn
+        nil -> nil
+        p -> Path.join(p, ".agent_reviews_always_read.txt")
+      end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    Enum.find_value(candidates, {nil, []}, fn path ->
+      if File.regular?(path) and File.exists?(path) do
+        case File.read(path) do
+          {:ok, content} ->
+            paths =
+              content
+              |> String.split(["\r\n", "\n", "\r"], trim: false)
+              |> Enum.map(&String.trim/1)
+              |> Enum.reject(&(&1 == ""))
+              |> Enum.reject(&String.starts_with?(&1, "#"))
+              |> Enum.take(25)
+
+            {path, paths}
+
+          _ ->
+            nil
+        end
+      end
+    end)
+  end
+
+  defp build_guidance_section(nil, nil, nil, []), do: ""
+
+  defp build_guidance_section(guidelines_path, guidelines_md, always_read_path, always_read) do
+    always_read_block =
+      if is_list(always_read) and always_read != [] do
+        label =
+          if is_binary(always_read_path) do
+            "Always-read list (from `#{always_read_path}`):"
+          else
+            "Always-read list:"
+          end
+
+        [
+          label,
+          "\n",
+          Enum.map(always_read, fn p -> ["- `", p, "`\n"] end),
+          "\n"
+        ]
+      else
+        []
+      end
+
+    guidelines_block =
+      if is_binary(guidelines_md) and String.trim(guidelines_md) != "" do
+        label =
+          if is_binary(guidelines_path) do
+            "Guidelines (from `#{guidelines_path}`):"
+          else
+            "Guidelines:"
+          end
+
+        [
+          label,
+          "\n\n",
+          guidelines_md,
+          "\n\n"
+        ]
+      else
+        []
+      end
+
+    if always_read_block == [] and guidelines_block == [] do
+      ""
+    else
+      IO.iodata_to_binary([
+        "## Repo Guidance (read first)\n",
+        "Before deciding/implementing anything, read and follow this repo guidance.\n",
+        "If a referenced file doesn't exist, mention it in your output and continue.\n\n",
+        always_read_block,
+        guidelines_block
+      ])
+    end
   end
 
   defp changed_files(root) do

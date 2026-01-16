@@ -45,6 +45,13 @@ Outputs are written under the target repo’s `.agent_review/` directory:
 
 Debug artifacts are only written on failures (e.g. agent logs, raw GitHub API pages).
 
+## Optional repo guidance
+
+If present in the target repo root (committable), these are injected into the agent prompt:
+
+- `.agent_reviews_guidelines.md` (freeform markdown guidance)
+- `.agent_reviews_always_read.txt` (one repo-relative path per line; files the agent should read before acting)
+
 ## Checkout behavior
 
 - `run` auto-checks out the PR branch via `gh pr checkout`.
