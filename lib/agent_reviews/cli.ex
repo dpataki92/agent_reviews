@@ -82,9 +82,11 @@ defmodule AgentReviews.CLI do
 
       ["post", pr_ref] ->
         if Map.get(opts, :worktree?, false) do
-          {:error, "--worktree is only supported for `run` (cd into the worktree and run `post` there)."}
+          {:error,
+           "--worktree is only supported for `run` (cd into the worktree and run `post` there)."}
         else
           _ = ensure_repo_local_exclude(root)
+
           case run_post(root, pr_ref, opts) do
             {:ok, post_ctx} ->
               print_post_summary(root, pr_ref, post_ctx, opts)
@@ -157,33 +159,96 @@ defmodule AgentReviews.CLI do
 
   defp run_in_root(root, pr_ref, opts) do
     with :ok <- ensure_clean_working_tree(root),
-         {:ok, _checkout_ctx} <- checkout_pr_branch(root, pr_ref),
+         {:ok, checkout_ctx} <- checkout_pr_branch(root, pr_ref),
          {:ok, fetch_ctx} <- run_fetch(root, pr_ref),
-         {:ok, apply_ctx} <- run_apply(root, fetch_ctx.tasks_json, opts),
-         commit_ctx <- maybe_commit(root, apply_ctx.tasks_json, opts) do
-      case commit_ctx do
-        {:error, msg} ->
-          {:error, msg}
+         {:ok, tasks_doc} <- read_tasks_json(fetch_ctx.tasks_json) do
+      pr_number = Map.get(checkout_ctx, :pr_number)
+      state_root = state_root(opts, root)
+      {:ok, prev_state} = load_pr_state(state_root, pr_number)
 
-        _ ->
-          write_review_responses!(
-            root,
-            apply_ctx.tasks_json,
-            apply_ctx.responses_md,
-            apply_ctx.agent_last_message,
-            apply_ctx.changed_files,
-            commit_ctx
-          )
+      diff = diff_since_last_run(tasks_doc, prev_state)
+      selection = select_tasks_for_agent(tasks_doc, diff, prev_state)
 
-          apply_ctx =
-            Map.put(
-              apply_ctx,
-              :posting_metadata,
-              detect_posting_metadata(root, apply_ctx.responses_md)
+      responses_md = Path.join([root, @agent_dir, "review_responses.md"])
+
+      apply_ctx =
+        case selection.agent_tasks_doc do
+          nil ->
+            {:ok,
+             %{
+               tasks_json: fetch_ctx.tasks_json,
+               responses_md: responses_md,
+               agent_last_message: "",
+               agent_ran?: false,
+               changed_files: changed_files(root)
+             }}
+
+          agent_tasks_doc ->
+            content = Jason.encode!(agent_tasks_doc, pretty: true) <> "\n"
+
+            with_temp_file("agent_reviews_tasks", ".json", content, fn agent_tasks_path ->
+              run_apply(root, fetch_ctx.tasks_json, agent_tasks_path, opts)
+            end)
+        end
+
+      with {:ok, apply_ctx} <- apply_ctx do
+        commit_ctx = maybe_commit(root, apply_ctx.tasks_json, opts)
+
+        case commit_ctx do
+          {:error, msg} ->
+            {:error, msg}
+
+          _ ->
+            {agent_body, agent_meta} =
+              if apply_ctx.agent_ran? do
+                split_agent_last_message(apply_ctx.agent_last_message)
+              else
+                {"", {:ok, %{"replies" => [], "top_level_comment" => ""}}}
+              end
+
+            {carried_replies, carried_notes} =
+              carried_forward_replies(tasks_doc, diff, prev_state)
+
+            final_meta =
+              merge_posting_metadata(tasks_doc, carried_replies, agent_meta, carried_notes)
+
+            write_review_responses!(
+              root,
+              tasks_doc,
+              apply_ctx.tasks_json,
+              apply_ctx.responses_md,
+              apply_ctx.agent_ran?,
+              agent_body,
+              apply_ctx.changed_files,
+              commit_ctx,
+              diff,
+              prev_state,
+              selection,
+              carried_replies,
+              carried_notes,
+              agent_meta,
+              final_meta
             )
 
-          print_run_summary(root, fetch_ctx, apply_ctx, commit_ctx, opts)
-          :ok
+            posting_metadata = detect_posting_metadata(root, apply_ctx.responses_md)
+
+            _ =
+              update_pr_state_after_run(
+                state_root,
+                pr_number,
+                tasks_doc,
+                prev_state,
+                agent_meta,
+                selection,
+                diff,
+                final_meta,
+                posting_metadata
+              )
+
+            apply_ctx = Map.put(apply_ctx, :posting_metadata, posting_metadata)
+            print_run_summary(root, fetch_ctx, apply_ctx, commit_ctx, opts)
+            :ok
+        end
       end
     end
   end
@@ -286,6 +351,83 @@ defmodule AgentReviews.CLI do
     end
   end
 
+  defp state_root(_opts, root), do: root
+
+  defp pr_state_path(state_root, pr_number) when is_integer(pr_number) do
+    Path.join([state_root, @agent_dir, "state", "pr-#{pr_number}.json"])
+  end
+
+  defp pr_state_path(_state_root, _), do: nil
+
+  defp load_pr_state(_state_root, nil), do: {:ok, nil}
+
+  defp load_pr_state(state_root, pr_number) when is_integer(pr_number) do
+    path = pr_state_path(state_root, pr_number)
+
+    if is_binary(path) and File.exists?(path) do
+      with {:ok, content} <- File.read(path),
+           {:ok, decoded} <- Jason.decode(content) do
+        {:ok, decoded}
+      else
+        _ -> {:ok, nil}
+      end
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp write_pr_state(_state_root, nil, _state), do: :ok
+
+  defp write_pr_state(state_root, pr_number, state)
+       when is_integer(pr_number) and is_map(state) do
+    with :ok <- ensure_agent_dir(state_root) do
+      path = pr_state_path(state_root, pr_number)
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, Jason.encode!(state, pretty: true) <> "\n")
+      :ok
+    end
+  end
+
+  defp mark_replies_posted(_state_root, nil, _thread_ids), do: :ok
+  defp mark_replies_posted(_state_root, _pr_number, []), do: :ok
+
+  defp mark_replies_posted(state_root, pr_number, thread_ids)
+       when is_integer(pr_number) and is_list(thread_ids) do
+    now =
+      DateTime.utc_now()
+      |> DateTime.to_iso8601()
+
+    case load_pr_state(state_root, pr_number) do
+      {:ok, state} when is_map(state) ->
+        threads = map_get_map(state, "threads")
+
+        threads =
+          Enum.reduce(thread_ids, threads, fn tid, acc ->
+            tid = to_string(tid) |> String.trim()
+
+            if tid == "" do
+              acc
+            else
+              entry = Map.get(acc, tid, %{})
+              decision = Map.get(entry, "decision", "") |> to_string() |> String.trim()
+              body = Map.get(entry, "reply_body", "") |> to_string() |> String.trim()
+
+              if decision in ["ANSWER", "PUSHBACK"] and body != "" do
+                Map.put(acc, tid, Map.put(entry, "reply_posted_at", now))
+              else
+                acc
+              end
+            end
+          end)
+
+        state = Map.put(state, "threads", threads)
+        write_pr_state(state_root, pr_number, state)
+
+      _ ->
+        :ok
+    end
+  end
+
   defp run_fetch(root, pr_ref) do
     with :ok <- ensure_gh_authed(),
          {:ok, {owner, repo, number}} <- parse_pr_ref(pr_ref, root),
@@ -338,54 +480,60 @@ defmodule AgentReviews.CLI do
     end
   end
 
-  defp run_apply(root, tasks_json_path, opts) do
+  defp run_apply(root, recorded_tasks_json_path, agent_tasks_json_path, opts) do
     responses_md = Path.join([root, @agent_dir, "review_responses.md"])
     debug_log = Path.join([root, @agent_dir, "debug_agent_exec.log"])
 
-    if not File.exists?(tasks_json_path) do
-      {:error, "Missing #{tasks_json_path} (run: #{opts.invoke} <pr>)"}
-    else
-      agent_cmd_in = Map.get(opts, :agent_cmd, "codex")
-      agent_args = shellwords(Map.get(opts, :agent_args, "")) ++ codex_args_from_opts(opts)
-      agent_args = maybe_add_full_auto(agent_args, true)
-      prompt = agent_prompt_template(opts, tasks_json_path, root)
+    cond do
+      not File.exists?(recorded_tasks_json_path) ->
+        {:error, "Missing #{recorded_tasks_json_path} (run: #{opts.invoke} <pr>)"}
 
-      with :ok <- ensure_on_recorded_pr_head(root, tasks_json_path),
-           {:ok, agent_cmd} <- resolve_agent_cmd(agent_cmd_in),
-           :ok <- ensure_agent_noninteractive(agent_cmd) do
-        if agent_cmd != agent_cmd_in do
-          IO.puts(:stderr, "INFO: Using agent executable at #{agent_cmd}")
+      not File.exists?(agent_tasks_json_path) ->
+        {:error, "Missing #{agent_tasks_json_path} (internal agent tasks file)"}
+
+      true ->
+        agent_cmd_in = Map.get(opts, :agent_cmd, "codex")
+        agent_args = shellwords(Map.get(opts, :agent_args, "")) ++ codex_args_from_opts(opts)
+        agent_args = maybe_add_full_auto(agent_args, true)
+        prompt = agent_prompt_template(opts, agent_tasks_json_path, root)
+
+        with :ok <- ensure_on_recorded_pr_head(root, recorded_tasks_json_path),
+             {:ok, agent_cmd} <- resolve_agent_cmd(agent_cmd_in),
+             :ok <- ensure_agent_noninteractive(agent_cmd) do
+          if agent_cmd != agent_cmd_in do
+            IO.puts(:stderr, "INFO: Using agent executable at #{agent_cmd}")
+          end
+
+          case run_agent_capture(root, agent_cmd, agent_args, prompt) do
+            {:ok, %{last_message: last_message}} ->
+              {:ok,
+               %{
+                 tasks_json: recorded_tasks_json_path,
+                 responses_md: responses_md,
+                 agent_last_message: last_message,
+                 agent_ran?: true,
+                 changed_files: changed_files(root)
+               }}
+
+            {:error, %{status: status, output: output, last_message: last_message}} ->
+              File.write!(debug_log, output)
+              IO.puts(:stderr, "Wrote debug: #{debug_log}")
+
+              write_failure_review_responses!(
+                root,
+                recorded_tasks_json_path,
+                responses_md,
+                status,
+                output,
+                last_message
+              )
+
+              hint = codex_failure_hint(output)
+              {:error, "Agent exited with status #{status} (see #{responses_md}).#{hint}"}
+          end
+        else
+          {:error, msg} -> {:error, msg}
         end
-
-        case run_agent_capture(root, agent_cmd, agent_args, prompt) do
-          {:ok, %{last_message: last_message}} ->
-            {:ok,
-             %{
-               tasks_json: tasks_json_path,
-               responses_md: responses_md,
-               agent_last_message: last_message,
-               changed_files: changed_files(root)
-             }}
-
-          {:error, %{status: status, output: output, last_message: last_message}} ->
-            File.write!(debug_log, output)
-            IO.puts(:stderr, "Wrote debug: #{debug_log}")
-
-            write_failure_review_responses!(
-              root,
-              tasks_json_path,
-              responses_md,
-              status,
-              output,
-              last_message
-            )
-
-            hint = codex_failure_hint(output)
-            {:error, "Agent exited with status #{status} (see #{responses_md}).#{hint}"}
-        end
-      else
-        {:error, msg} -> {:error, msg}
-      end
     end
   end
 
@@ -708,7 +856,8 @@ defmodule AgentReviews.CLI do
 
   defp run_post(root, pr_ref, opts) do
     with :ok <- ensure_gh_authed(),
-         :ok <- ensure_cmd("gh") do
+         :ok <- ensure_cmd("gh"),
+         {:ok, {_owner, _repo, pr_number}} <- parse_pr_ref(pr_ref, root) do
       responses = Path.join([root, @agent_dir, "review_responses.md"])
       tasks_json = Path.join([root, @agent_dir, "tasks.json"])
 
@@ -732,21 +881,49 @@ defmodule AgentReviews.CLI do
                 top_level_result = maybe_post_top_level_comment(root, pr_ref, top_level_comment)
 
                 case {replies_result, top_level_result} do
-                  {{:ok, posted}, :ok} ->
+                  {{:ok, posted, posted_thread_ids}, :ok} ->
+                    _ =
+                      mark_replies_posted(
+                        state_root(opts, root),
+                        pr_number,
+                        posted_thread_ids
+                      )
+
                     {:ok,
                      %{
                        posted_replies: posted,
                        top_level_posted?: String.trim(to_string(top_level_comment)) != ""
                      }}
 
-                  {{:error, msg}, :ok} ->
+                  {{:error, msg, posted_thread_ids}, :ok} ->
+                    _ =
+                      mark_replies_posted(
+                        state_root(opts, root),
+                        pr_number,
+                        posted_thread_ids
+                      )
+
                     {:error, msg}
 
-                  {{:ok, posted}, {:error, msg}} ->
+                  {{:ok, posted, posted_thread_ids}, {:error, msg}} ->
+                    _ =
+                      mark_replies_posted(
+                        state_root(opts, root),
+                        pr_number,
+                        posted_thread_ids
+                      )
+
                     {:error,
                      "Posted #{posted} thread replies, but failed to post top-level comment.\n\n#{msg}"}
 
-                  {{:error, msg1}, {:error, msg2}} ->
+                  {{:error, msg1, posted_thread_ids}, {:error, msg2}} ->
+                    _ =
+                      mark_replies_posted(
+                        state_root(opts, root),
+                        pr_number,
+                        posted_thread_ids
+                      )
+
                     {:error, msg1 <> "\n\n" <> msg2}
                 end
               else
@@ -1141,6 +1318,486 @@ defmodule AgentReviews.CLI do
     end
   end
 
+  defp diff_since_last_run(tasks_doc, prev_state) when is_map(tasks_doc) do
+    tasks = Map.get(tasks_doc, "tasks", []) || []
+
+    current_thread_ids =
+      tasks
+      |> Enum.map(&task_thread_id/1)
+      |> Enum.reject(&(&1 == ""))
+      |> MapSet.new()
+
+    prev_open =
+      prev_state
+      |> map_get_list("last_open_thread_ids")
+      |> Enum.map(&to_string/1)
+      |> Enum.reject(&(&1 == ""))
+      |> MapSet.new()
+
+    prev_threads = prev_state |> map_get_map("threads")
+
+    new_ids = MapSet.difference(current_thread_ids, prev_open)
+    resolved_ids = MapSet.difference(prev_open, current_thread_ids)
+    common_ids = MapSet.intersection(current_thread_ids, prev_open)
+
+    updated_ids =
+      Enum.reduce(common_ids, MapSet.new(), fn tid, acc ->
+        prev_fp =
+          prev_threads
+          |> Map.get(tid, %{})
+          |> Map.get("fingerprint", "")
+          |> to_string()
+
+        current_fp =
+          tasks
+          |> Enum.find(fn t -> task_thread_id(t) == tid end)
+          |> then(fn
+            nil -> ""
+            t -> task_fingerprint(t)
+          end)
+
+        if prev_fp != "" and current_fp != "" and prev_fp != current_fp do
+          MapSet.put(acc, tid)
+        else
+          acc
+        end
+      end)
+
+    carried_ids = MapSet.difference(common_ids, updated_ids)
+
+    carried_needs_attention_ids =
+      Enum.reduce(carried_ids, MapSet.new(), fn tid, acc ->
+        decision =
+          prev_threads
+          |> Map.get(tid, %{})
+          |> Map.get("decision", nil)
+
+        decision = if is_binary(decision), do: String.trim(decision), else: nil
+
+        if decision in ["ACCEPT", "ANSWER", "PUSHBACK"] do
+          acc
+        else
+          MapSet.put(acc, tid)
+        end
+      end)
+
+    %{
+      prev_run_at: map_get_string(prev_state, "last_run_at"),
+      current_open_ids: MapSet.to_list(current_thread_ids),
+      prev_open_ids: MapSet.to_list(prev_open),
+      new_ids: MapSet.to_list(new_ids),
+      updated_ids: MapSet.to_list(updated_ids),
+      carried_ids: MapSet.to_list(carried_ids),
+      carried_needs_attention_ids: MapSet.to_list(carried_needs_attention_ids),
+      resolved_ids: MapSet.to_list(resolved_ids)
+    }
+  end
+
+  defp select_tasks_for_agent(tasks_doc, diff, prev_state) when is_map(tasks_doc) do
+    tasks = Map.get(tasks_doc, "tasks", []) || []
+
+    if tasks == [] do
+      %{agent_tasks: [], agent_tasks_doc: nil, skipped_thread_ids: [], handled_thread_ids: []}
+    else
+      prev_run_at = map_get_string(prev_state, "last_run_at")
+
+      {agent_thread_ids, handled_thread_ids} =
+        if prev_run_at == "" do
+          {tasks |> Enum.map(&task_thread_id/1) |> Enum.reject(&(&1 == "")), []}
+        else
+          to_handle =
+            MapSet.new(diff.new_ids ++ diff.updated_ids ++ diff.carried_needs_attention_ids)
+
+          handled = MapSet.new(diff.carried_ids -- diff.carried_needs_attention_ids)
+
+          {MapSet.to_list(to_handle), MapSet.to_list(handled)}
+        end
+
+      agent_thread_set = MapSet.new(agent_thread_ids)
+
+      agent_tasks =
+        tasks
+        |> Enum.filter(fn t -> MapSet.member?(agent_thread_set, task_thread_id(t)) end)
+
+      enriched =
+        if prev_state do
+          threads = map_get_map(prev_state, "threads")
+
+          Enum.map(agent_tasks, fn t ->
+            tid = task_thread_id(t)
+            entry = Map.get(threads, tid, %{})
+
+            t
+            |> Map.put("prior_decision", Map.get(entry, "decision", nil))
+            |> Map.put("prior_decision_at", Map.get(entry, "decision_at", nil))
+            |> Map.put("prior_reply_body", Map.get(entry, "reply_body", nil))
+            |> Map.put("prior_reply_posted_at", Map.get(entry, "reply_posted_at", nil))
+          end)
+        else
+          agent_tasks
+        end
+
+      agent_tasks_doc =
+        tasks_doc
+        |> Map.put("tasks", enriched)
+        |> Map.put("previous_run_at", map_get_string(prev_state, "last_run_at"))
+
+      skipped_thread_ids =
+        tasks
+        |> Enum.map(&task_thread_id/1)
+        |> Enum.reject(&(&1 == ""))
+        |> Enum.reject(fn tid -> MapSet.member?(agent_thread_set, tid) end)
+
+      %{
+        agent_tasks: enriched,
+        agent_tasks_doc: if(enriched == [], do: nil, else: agent_tasks_doc),
+        skipped_thread_ids: skipped_thread_ids,
+        handled_thread_ids: handled_thread_ids
+      }
+    end
+  end
+
+  defp carried_forward_replies(tasks_doc, diff, prev_state) when is_map(tasks_doc) do
+    tasks = Map.get(tasks_doc, "tasks", []) || []
+    by_tid = Map.new(tasks, fn t -> {task_thread_id(t), t} end)
+
+    threads = prev_state |> map_get_map("threads")
+    carried_set = MapSet.new(diff.carried_ids)
+
+    replies =
+      carried_set
+      |> Enum.flat_map(fn tid ->
+        entry = Map.get(threads, tid, %{})
+        decision = Map.get(entry, "decision", "") |> to_string() |> String.trim()
+        body = Map.get(entry, "reply_body", "") |> to_string()
+        posted_at = Map.get(entry, "reply_posted_at", nil)
+
+        cond do
+          decision not in ["ANSWER", "PUSHBACK"] ->
+            []
+
+          String.trim(body) == "" ->
+            []
+
+          is_binary(posted_at) and String.trim(posted_at) != "" ->
+            []
+
+          not Map.has_key?(by_tid, tid) ->
+            []
+
+          true ->
+            [
+              %{
+                "thread_id" => tid,
+                "decision" => decision,
+                "body" => body,
+                "decision_at" => Map.get(entry, "decision_at", nil)
+              }
+            ]
+        end
+      end)
+
+    notes =
+      carried_set
+      |> Enum.reduce(%{}, fn tid, acc ->
+        entry = Map.get(threads, tid, %{})
+
+        Map.put(acc, tid, %{
+          "decision" => Map.get(entry, "decision", nil),
+          "decision_at" => Map.get(entry, "decision_at", nil),
+          "reply_posted_at" => Map.get(entry, "reply_posted_at", nil),
+          "last_task_id" => Map.get(entry, "last_task_id", nil),
+          "last_loc" => Map.get(entry, "last_loc", nil),
+          "ask_excerpt" => Map.get(entry, "ask_excerpt", nil)
+        })
+      end)
+
+    {replies, notes}
+  end
+
+  defp split_agent_last_message(message) when is_binary(message) do
+    case Regex.run(
+           ~r/\A(.*)```[ \t]*(json|jsonc)[ \t]*\r?\n(.*?)\r?\n```[ \t]*\r?\n?\s*\z/si,
+           message,
+           capture: :all_but_first
+         ) do
+      [before, _lang, json] ->
+        body = before |> String.trim_trailing()
+        json = String.trim(json)
+
+        case parse_posting_metadata_json(json) do
+          {:ok, decoded} -> {body, {:ok, decoded}}
+          {:error, reason} -> {message, {:error, reason}}
+        end
+
+      _ ->
+        {message, {:error, "Missing final posting metadata JSON block."}}
+    end
+  end
+
+  defp merge_posting_metadata(tasks_doc, carried_replies, agent_meta, carried_notes)
+       when is_map(tasks_doc) do
+    tasks = Map.get(tasks_doc, "tasks", []) || []
+    by_tid = Map.new(tasks, fn t -> {task_thread_id(t), t} end)
+
+    carried =
+      carried_replies
+      |> Enum.map(fn r -> {Map.get(r, "thread_id", "") |> to_string(), r} end)
+      |> Enum.reject(fn {tid, _} -> tid == "" end)
+      |> Map.new()
+
+    agent =
+      case agent_meta do
+        {:ok, %{"replies" => replies}} when is_list(replies) -> replies
+        _ -> []
+      end
+      |> Enum.map(fn r -> {Map.get(r, "thread_id", "") |> to_string(), r} end)
+      |> Enum.reject(fn {tid, _} -> tid == "" end)
+      |> Map.new()
+
+    merged =
+      carried
+      |> Map.merge(agent)
+      |> Enum.flat_map(fn {tid, r} ->
+        task = Map.get(by_tid, tid)
+
+        with true <- is_map(task),
+             id when is_integer(id) <- Map.get(task, "id"),
+             decision when is_binary(decision) <- Map.get(r, "decision"),
+             true <- String.trim(decision) != "",
+             body when is_binary(body) <- Map.get(r, "body"),
+             body_trim <- String.trim(body),
+             true <- body_trim != "" do
+          [
+            %{
+              "task_id" => id,
+              "thread_id" => tid,
+              "decision" => decision,
+              "body" => body_trim
+            }
+          ]
+        else
+          _ -> []
+        end
+      end)
+      |> Enum.sort_by(fn r -> Map.get(r, "task_id", 0) end)
+
+    top_level_comment =
+      case agent_meta do
+        {:ok, %{"top_level_comment" => tlc}} when is_binary(tlc) -> tlc
+        _ -> ""
+      end
+
+    _carried_notes = carried_notes
+
+    %{"replies" => merged, "top_level_comment" => top_level_comment}
+  end
+
+  defp task_thread_id(task) when is_map(task),
+    do: Map.get(task, "thread_id", "") |> to_string() |> String.trim()
+
+  defp task_fingerprint(task) when is_map(task) do
+    latest = Map.get(task, "latest_comment", %{}) || %{}
+
+    data =
+      [
+        Map.get(task, "path", ""),
+        to_string(Map.get(task, "line", "")),
+        to_string(Map.get(task, "diff_side", "")),
+        to_string(Map.get(task, "type", "")),
+        to_string(Map.get(task, "comment_total_count", "")),
+        to_string(Map.get(task, "comment_count", "")),
+        to_string(Map.get(task, "comments_truncated", "")),
+        to_string(Map.get(latest, "created_at", "")),
+        to_string(Map.get(latest, "author", "")),
+        to_string(Map.get(latest, "body", "")),
+        to_string(Map.get(task, "body", ""))
+      ]
+      |> Enum.join("\n")
+
+    :crypto.hash(:sha256, data)
+    |> Base.encode16(case: :lower)
+  end
+
+  defp map_get_string(nil, _k), do: ""
+  defp map_get_string(map, k) when is_map(map), do: Map.get(map, k, "") |> to_string()
+  defp map_get_string(_, _), do: ""
+
+  defp map_get_list(nil, _k), do: []
+  defp map_get_list(map, k) when is_map(map), do: Map.get(map, k, []) || []
+  defp map_get_list(_, _), do: []
+
+  defp map_get_map(nil, _k), do: %{}
+  defp map_get_map(map, k) when is_map(map), do: Map.get(map, k, %{}) || %{}
+  defp map_get_map(_, _), do: %{}
+
+  defp update_pr_state_after_run(
+         state_root,
+         pr_number,
+         tasks_doc,
+         prev_state,
+         agent_meta,
+         selection,
+         diff,
+         final_meta,
+         _posting_metadata
+       )
+       when is_integer(pr_number) and is_map(tasks_doc) do
+    now =
+      DateTime.utc_now()
+      |> DateTime.to_iso8601()
+
+    tasks = Map.get(tasks_doc, "tasks", []) || []
+
+    current_thread_ids =
+      tasks
+      |> Enum.map(&task_thread_id/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+
+    prev_threads = prev_state |> map_get_map("threads")
+
+    threads =
+      Enum.reduce(tasks, prev_threads, fn t, acc ->
+        tid = task_thread_id(t)
+
+        if tid == "" do
+          acc
+        else
+          fp = task_fingerprint(t)
+          loc = task_loc(t)
+          excerpt = wrapper_excerpt(Map.get(t, "body", "") |> to_string())
+
+          entry =
+            acc
+            |> Map.get(tid, %{})
+            |> Map.put("open", true)
+            |> Map.put("fingerprint", fp)
+            |> Map.put("last_seen_at", now)
+            |> Map.put("last_task_id", Map.get(t, "id", nil))
+            |> Map.put("last_loc", loc)
+            |> Map.put("ask_excerpt", excerpt)
+
+          Map.put(acc, tid, entry)
+        end
+      end)
+
+    # Mark threads resolved if they were open last run but are absent now.
+    prev_open = Map.get(diff, :prev_open_ids, []) || []
+    current_set = MapSet.new(current_thread_ids)
+
+    threads =
+      Enum.reduce(prev_open, threads, fn tid, acc ->
+        if MapSet.member?(current_set, tid) do
+          acc
+        else
+          entry =
+            acc
+            |> Map.get(tid, %{})
+            |> Map.put("open", false)
+            |> Map.put("resolved_at", now)
+
+          Map.put(acc, tid, entry)
+        end
+      end)
+
+    threads =
+      threads
+      |> Enum.reduce(%{}, fn {tid, entry}, acc ->
+        # Ensure closed threads that are not in current set remain closed.
+        open? = Map.get(entry, "open", false) == true
+
+        entry =
+          if open? and not MapSet.member?(current_set, tid) do
+            entry |> Map.put("open", false) |> Map.put_new("resolved_at", now)
+          else
+            entry
+          end
+
+        Map.put(acc, tid, entry)
+      end)
+
+    threads =
+      update_decisions_for_agent_tasks(threads, selection, agent_meta, final_meta, now)
+
+    state =
+      %{
+        "version" => 1,
+        "pr_number" => pr_number,
+        "pr_url" => Map.get(tasks_doc, "pr_url", "") |> to_string(),
+        "pr_title" => Map.get(tasks_doc, "pr_title", "") |> to_string(),
+        "last_run_at" => now,
+        "last_open_thread_ids" => current_thread_ids,
+        "threads" => threads
+      }
+
+    write_pr_state(state_root, pr_number, state)
+  end
+
+  defp update_pr_state_after_run(
+         _state_root,
+         _pr_number,
+         _tasks_doc,
+         _prev_state,
+         _agent_meta,
+         _selection,
+         _diff,
+         _final_meta,
+         _posting_metadata
+       ),
+       do: :ok
+
+  defp update_decisions_for_agent_tasks(threads, selection, agent_meta, _final_meta, now)
+       when is_map(threads) do
+    agent_tasks = Map.get(selection, :agent_tasks, []) || []
+
+    agent_thread_ids =
+      agent_tasks
+      |> Enum.map(&task_thread_id/1)
+      |> Enum.reject(&(&1 == ""))
+
+    agent_replies_by_tid =
+      case agent_meta do
+        {:ok, %{"replies" => replies}} when is_list(replies) ->
+          replies
+          |> Enum.reduce(%{}, fn r, acc ->
+            tid = Map.get(r, "thread_id", "") |> to_string() |> String.trim()
+            if tid == "", do: acc, else: Map.put(acc, tid, r)
+          end)
+
+        _ ->
+          :no_meta
+      end
+
+    if agent_replies_by_tid == :no_meta do
+      threads
+    else
+      Enum.reduce(agent_thread_ids, threads, fn tid, acc ->
+        entry = Map.get(acc, tid, %{})
+
+        {decision, body} =
+          case Map.get(agent_replies_by_tid, tid, nil) do
+            nil ->
+              {"ACCEPT", ""}
+
+            r ->
+              d = Map.get(r, "decision", "") |> to_string() |> String.trim()
+              b = Map.get(r, "body", "") |> to_string()
+              {if(d == "", do: "ANSWER", else: d), b}
+          end
+
+        entry =
+          entry
+          |> Map.put("decision", decision)
+          |> Map.put("decision_at", now)
+          |> Map.put("reply_body", if(decision in ["ANSWER", "PUSHBACK"], do: body, else: ""))
+          |> Map.put("reply_posted_at", nil)
+
+        Map.put(acc, tid, entry)
+      end)
+    end
+  end
+
   defp ensure_agent_noninteractive(agent_cmd) do
     {out, status} = System.cmd(agent_cmd, ["exec", "--help"], stderr_to_stdout: true)
 
@@ -1256,12 +1913,20 @@ defmodule AgentReviews.CLI do
   defp thread_suffix(thread_id), do: AgentReviews.Tasks.thread_suffix(thread_id)
 
   defp agent_prompt_template(_opts, tasks_json_path, root) do
-    tasks_rel = Path.relative_to(tasks_json_path, root)
+    tasks_abs = Path.expand(tasks_json_path)
+    root_abs = Path.expand(root)
+
+    tasks_ref =
+      if String.starts_with?(tasks_abs, root_abs <> "/") do
+        Path.relative_to(tasks_abs, root_abs)
+      else
+        tasks_abs
+      end
 
     """
     # PR Review Implementation Task
 
-    Read `#{tasks_rel}` and implement/respond to each task systematically.
+    Read `#{tasks_ref}` and implement/respond to each task systematically.
 
     ## Decision Framework
     For each task, choose ONE action:
@@ -1280,7 +1945,7 @@ defmodule AgentReviews.CLI do
     - NO commits or pushes
     ## Output Requirements (important)
 
-    - You MUST list **all** tasks from `#{tasks_rel}` in order (Task 1..N).
+    - You MUST list **all** tasks from `#{tasks_ref}` in order (Task 1..N).
     - For each task, include a short excerpt of the original ask so a developer can understand the request without opening GitHub.
     - For **ACCEPT** decisions: be concise (what changed + which files).
     - For **ANSWER** and **PUSHBACK** decisions: be more verbose with reasoning, and include small examples/snippets when helpful. The response should be copy-paste ready for GitHub.
@@ -1320,7 +1985,7 @@ defmodule AgentReviews.CLI do
 
     Rules:
     - Include a `replies[]` entry for each task you **ANSWER** or **PUSHBACK** (one per task).
-    - `thread_id` must come from `#{tasks_rel}` for that task.
+    - `thread_id` must come from `#{tasks_ref}` for that task.
     - `decision` must be `ANSWER` or `PUSHBACK`.
     - `top_level_comment` may be an empty string if you don't want a top-level PR comment.
     - The JSON block must be the final fenced ```json block at the end of the file (no other JSON blocks after it).
@@ -1536,8 +2201,8 @@ defmodule AgentReviews.CLI do
   end
 
   defp post_thread_replies(root, replies, task_map) do
-    {posted, failed, errors_log} =
-      Enum.reduce(replies, {0, 0, nil}, fn reply, {posted, failed, errors_log} ->
+    {posted, failed, errors_log, posted_thread_ids} =
+      Enum.reduce(replies, {0, 0, nil, []}, fn reply, {posted, failed, errors_log, posted_ids} ->
         with {:ok, decision} <- fetch_string(reply, "decision"),
              true <- decision in ["ANSWER", "PUSHBACK"],
              {:ok, task_id} <- fetch_int(reply, "task_id"),
@@ -1548,7 +2213,7 @@ defmodule AgentReviews.CLI do
              true <- body_trim != "" do
           case post_thread_reply(root, thread_id, body_trim) do
             :ok ->
-              {posted + 1, failed, errors_log}
+              {posted + 1, failed, errors_log, [thread_id | posted_ids]}
 
             {:error, out} ->
               errors_log = errors_log || Path.join([root, @agent_dir, "post_errors.log"])
@@ -1559,7 +2224,7 @@ defmodule AgentReviews.CLI do
                 "ERROR: Failed to post reply for task_id=#{task_id} (see #{errors_log})."
               )
 
-              {posted, failed + 1, errors_log}
+              {posted, failed + 1, errors_log, posted_ids}
           end
         else
           {:ok, decision} ->
@@ -1568,25 +2233,26 @@ defmodule AgentReviews.CLI do
               "WARN: Skipping reply with decision=#{inspect(decision)} (only ANSWER/PUSHBACK are posted)."
             )
 
-            {posted, failed, errors_log}
+            {posted, failed, errors_log, posted_ids}
 
           {:error, msg} ->
             IO.puts(:stderr, "WARN: Skipping malformed reply entry: #{msg}")
-            {posted, failed, errors_log}
+            {posted, failed, errors_log, posted_ids}
 
           false ->
             IO.puts(:stderr, "WARN: Skipping malformed reply entry.")
-            {posted, failed, errors_log}
+            {posted, failed, errors_log, posted_ids}
         end
       end)
 
     if failed == 0 do
-      {:ok, posted}
+      {:ok, posted, Enum.reverse(posted_thread_ids)}
     else
       errors_log = errors_log || Path.join([root, @agent_dir, "post_errors.log"])
 
       {:error,
-       "Some thread replies failed to post (posted=#{posted}, failed=#{failed}).\nSee: #{errors_log}\n\nCommon causes: missing permissions (fork PR), GitHub auth scope, or rate limits."}
+       "Some thread replies failed to post (posted=#{posted}, failed=#{failed}).\nSee: #{errors_log}\n\nCommon causes: missing permissions (fork PR), GitHub auth scope, or rate limits.",
+       Enum.reverse(posted_thread_ids)}
     end
   end
 
@@ -1641,23 +2307,26 @@ defmodule AgentReviews.CLI do
 
   defp write_review_responses!(
          root,
+         tasks_doc,
          tasks_json_path,
          responses_md,
-         agent_last_message,
+         agent_ran?,
+         agent_body,
          changed_files,
-         commit_ctx
+         commit_ctx,
+         diff,
+         prev_state,
+         selection,
+         carried_replies,
+         carried_notes,
+         agent_meta,
+         final_meta
        ) do
     tasks_rel = Path.relative_to(tasks_json_path, root)
-    tasks = tasks_list_for_wrapper(tasks_json_path)
+    tasks_list = tasks_list_for_wrapper(tasks_json_path)
 
-    {pr_title, pr_url} =
-      case read_tasks_json(tasks_json_path) do
-        {:ok, decoded} ->
-          {Map.get(decoded, "pr_title", "") |> to_string(), Map.get(decoded, "pr_url", "") |> to_string()}
-
-        _ ->
-          {"", ""}
-      end
+    pr_title = Map.get(tasks_doc, "pr_title", "") |> to_string()
+    pr_url = Map.get(tasks_doc, "pr_url", "") |> to_string()
 
     now =
       DateTime.utc_now()
@@ -1670,13 +2339,31 @@ defmodule AgentReviews.CLI do
         changed_files |> Enum.map(fn f -> "- `#{f}`\n" end) |> IO.iodata_to_binary()
       end
 
-    raw =
-      agent_last_message
-      |> to_string()
-      |> String.trim_trailing()
-      |> Kernel.<>("\n")
+    tasks = Map.get(tasks_doc, "tasks", []) || []
+    tasks_by_tid = Map.new(tasks, fn t -> {task_thread_id(t), t} end)
 
-    header =
+    since_last = since_last_section(diff, tasks_by_tid, prev_state, selection, carried_notes)
+    carried = carried_replies_section(carried_replies, tasks_by_tid)
+    agent_meta_note = agent_meta_note(agent_meta, agent_ran?)
+
+    agent_output =
+      cond do
+        not agent_ran? and tasks == [] ->
+          "_No unresolved review threads found._\n"
+
+        not agent_ran? ->
+          "_No new/updated tasks required agent work._\n"
+
+        true ->
+          agent_body
+          |> to_string()
+          |> String.trim_trailing()
+          |> Kernel.<>("\n")
+      end
+
+    meta_json = Jason.encode!(final_meta, pretty: true) <> "\n"
+
+    doc =
       [
         "# PR Review Responses\n",
         "\n",
@@ -1692,22 +2379,227 @@ defmodule AgentReviews.CLI do
         format_commit(commit_ctx),
         "\n",
         "\n",
+        since_last,
         "## Task List\n",
-        tasks,
+        tasks_list,
         "\n",
         "## Working Tree\n",
         changed,
         "\n",
+        carried,
         "---\n",
         "\n",
         "## Agent Output (Last Message)\n",
-        "\n"
+        "\n",
+        agent_meta_note,
+        agent_output,
+        "\n",
+        "## Posting Metadata (final)\n",
+        "\n",
+        "```json\n",
+        meta_json,
+        "```\n"
       ]
       |> IO.iodata_to_binary()
 
-    File.write!(responses_md, header <> raw)
+    File.write!(responses_md, doc)
     IO.puts("Wrote: #{responses_md}")
     :ok
+  end
+
+  defp since_last_section(diff, tasks_by_tid, prev_state, selection, carried_notes)
+       when is_map(tasks_by_tid) do
+    prev_at = Map.get(diff, :prev_run_at, "") |> to_string() |> String.trim()
+
+    if prev_at == "" do
+      ""
+    else
+      new_items = format_since_last_items(diff.new_ids, tasks_by_tid)
+      updated_items = format_since_last_items(diff.updated_ids, tasks_by_tid)
+      carried_items = format_since_last_items(diff.carried_ids, tasks_by_tid)
+      resolved_items = format_since_last_resolved(diff.resolved_ids, prev_state)
+
+      carried_total = length(diff.carried_ids)
+
+      carried_handled =
+        carried_notes
+        |> Enum.count(fn {_tid, note} ->
+          decision = Map.get(note, "decision", nil) |> to_string() |> String.trim()
+          decision in ["ACCEPT", "ANSWER", "PUSHBACK"]
+        end)
+
+      agent_tasks = length(Map.get(selection, :agent_tasks, []))
+
+      [
+        "## Since Last Run\n",
+        "- Previous run: ",
+        prev_at,
+        "\n",
+        "- New: ",
+        Integer.to_string(length(diff.new_ids)),
+        "\n",
+        if(new_items != "", do: [new_items, "\n"], else: []),
+        "- Updated: ",
+        Integer.to_string(length(diff.updated_ids)),
+        "\n",
+        if(updated_items != "", do: [updated_items, "\n"], else: []),
+        "- Carried forward: ",
+        Integer.to_string(carried_total),
+        " (previously handled: ",
+        Integer.to_string(carried_handled),
+        ")\n",
+        if(carried_items != "", do: [carried_items, "\n"], else: []),
+        "- Resolved since last run: ",
+        Integer.to_string(length(diff.resolved_ids)),
+        "\n",
+        if(resolved_items != "", do: [resolved_items, "\n"], else: []),
+        "- Agent tasks this run: ",
+        Integer.to_string(agent_tasks),
+        "\n\n"
+      ]
+    end
+  end
+
+  defp format_since_last_items(thread_ids, tasks_by_tid) when is_list(thread_ids) do
+    thread_ids =
+      thread_ids
+      |> Enum.uniq()
+      |> Enum.sort_by(fn tid ->
+        case Map.get(tasks_by_tid, tid) do
+          %{"id" => id} when is_integer(id) -> id
+          _ -> 9_999_999
+        end
+      end)
+
+    items =
+      thread_ids
+      |> Enum.flat_map(fn tid ->
+        case Map.get(tasks_by_tid, tid) do
+          nil ->
+            []
+
+          t ->
+            id = Map.get(t, "id", 0)
+            loc = task_loc(t)
+            suffix = thread_suffix(tid)
+            excerpt = wrapper_excerpt(Map.get(t, "body", "") |> to_string())
+            ["  - Task ", to_string(id), ": `", loc, "` (thread …", suffix, "): ", excerpt, "\n"]
+        end
+      end)
+
+    if items == [], do: "", else: IO.iodata_to_binary(items)
+  end
+
+  defp format_since_last_resolved(thread_ids, prev_state) when is_list(thread_ids) do
+    threads = map_get_map(prev_state, "threads")
+
+    thread_ids =
+      thread_ids
+      |> Enum.uniq()
+      |> Enum.sort_by(fn tid ->
+        case Map.get(threads, tid, %{}) do
+          %{"last_task_id" => id} when is_integer(id) -> id
+          _ -> 9_999_999
+        end
+      end)
+
+    items =
+      thread_ids
+      |> Enum.flat_map(fn tid ->
+        entry = Map.get(threads, tid, %{})
+        loc = Map.get(entry, "last_loc", nil) |> to_string()
+        excerpt = Map.get(entry, "ask_excerpt", nil) |> to_string()
+        suffix = thread_suffix(tid)
+
+        if String.trim(loc) == "" and String.trim(excerpt) == "" do
+          []
+        else
+          [
+            "  - (thread …",
+            suffix,
+            ") ",
+            if(String.trim(loc) != "", do: ["`", loc, "` "], else: []),
+            if(String.trim(excerpt) != "", do: [excerpt], else: []),
+            "\n"
+          ]
+        end
+      end)
+
+    if items == [], do: "", else: IO.iodata_to_binary(items)
+  end
+
+  defp carried_replies_section([], _tasks_by_tid), do: ""
+
+  defp carried_replies_section(replies, tasks_by_tid) when is_list(replies) do
+    blocks =
+      replies
+      |> Enum.flat_map(fn r ->
+        tid = Map.get(r, "thread_id", "") |> to_string()
+        decision = Map.get(r, "decision", "") |> to_string()
+        body = Map.get(r, "body", "") |> to_string() |> String.trim_trailing()
+        decision_at = Map.get(r, "decision_at", nil) |> to_string() |> String.trim()
+
+        case Map.get(tasks_by_tid, tid) do
+          nil ->
+            []
+
+          t ->
+            id = Map.get(t, "id", 0)
+            loc = task_loc(t)
+            suffix = thread_suffix(tid)
+
+            meta =
+              [
+                "### Task ",
+                to_string(id),
+                ": carried forward (",
+                decision,
+                ", thread …",
+                suffix,
+                ")\n",
+                "- Location: `",
+                loc,
+                "`\n",
+                if(decision_at != "", do: ["- Previous response: ", decision_at, "\n"], else: []),
+                "\n",
+                "**Reply (carried forward):**\n",
+                "\n",
+                body,
+                "\n\n"
+              ]
+
+            [meta]
+        end
+      end)
+
+    if blocks == [] do
+      ""
+    else
+      IO.iodata_to_binary(["## Carried Forward Replies\n\n", blocks, "\n"])
+    end
+  end
+
+  defp agent_meta_note(_agent_meta, false), do: ""
+
+  defp agent_meta_note(agent_meta, true) do
+    case agent_meta do
+      {:ok, _} ->
+        ""
+
+      {:error, reason} ->
+        ["_Note: could not parse agent posting metadata: ", to_string(reason), "_\n\n"]
+    end
+  end
+
+  defp task_loc(task) when is_map(task) do
+    path = Map.get(task, "path", "") |> to_string()
+    line = Map.get(task, "line", nil)
+
+    if is_integer(line) do
+      "#{path}:#{line}"
+    else
+      path
+    end
   end
 
   defp write_failure_review_responses!(

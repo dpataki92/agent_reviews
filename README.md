@@ -41,6 +41,7 @@ Outputs are written under the target repo’s `.agent_review/` directory:
 
 - `tasks.json`
 - `review_responses.md` (main user document)
+- `state/pr-<n>.json` (internal run history; used to show what’s new/changed since last run and avoid redoing work)
 
 Debug artifacts are only written on failures (e.g. agent logs, raw GitHub API pages).
 
