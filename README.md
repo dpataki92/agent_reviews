@@ -23,7 +23,7 @@ First run (once, in this repo):
 - `elixir` (includes `mix`)
 - `git`
 - `gh` (authenticated via `gh auth login`)
-- `codex` (Codex CLI; set `AGENT_CMD` if it’s not on PATH)
+- `codex` (Codex CLI) **or** `claude` (Claude Code CLI; set `AGENT_CMD` if it’s not on PATH)
 
 ## Usage
 
@@ -92,6 +92,17 @@ Escape hatch (env vars):
 
 - `AGENT_CMD`
 - `AGENT_ARGS`
+
+Claude notes:
+
+- Set `AGENT_CMD=claude` to use Claude Code CLI.
+- Runs use `claude -p --output-format json --no-session-persistence` by default (non-interactive and robust output capture).
+- `reasoning_effort` doesn’t map to a native Claude Code flag; it’s injected as a lightweight system hint only.
+
+Examples:
+
+- `AGENT_CMD=claude agent_reviews 123`
+- `AGENT_CMD=claude agent_reviews run https://github.com/owner/repo/pull/123`
 
 ## Notes
 

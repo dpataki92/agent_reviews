@@ -525,17 +525,17 @@ defmodule AgentReviews.CLI do
         agent_cmd_in = Map.get(opts, :agent_cmd, "codex")
 
         with {:ok, split_args} <- split_agent_args(Map.get(opts, :agent_args, "")),
-             agent_args <- split_args ++ codex_args_from_opts(opts),
-             agent_args <- maybe_add_full_auto(agent_args, true),
              prompt <- agent_prompt_template(opts, agent_tasks_json_path, root),
              :ok <- ensure_on_recorded_pr_head(root, recorded_tasks_json_path),
              {:ok, agent_cmd} <- resolve_agent_cmd(agent_cmd_in),
-             :ok <- ensure_agent_noninteractive(agent_cmd) do
+             {:ok, agent_type} <- AgentReviews.AgentAdapter.detect_agent_type(agent_cmd),
+             :ok <-
+               AgentReviews.AgentAdapter.validate_noninteractive_support(agent_cmd, agent_type) do
           if agent_cmd != agent_cmd_in do
             IO.puts(:stderr, "INFO: Using agent executable at #{agent_cmd}")
           end
 
-          case run_agent_capture(root, agent_cmd, agent_args, prompt) do
+          case run_agent_capture(root, agent_cmd, agent_type, split_args, opts, prompt) do
             {:ok, %{last_message: last_message}} ->
               {:ok,
                %{
@@ -559,11 +559,16 @@ defmodule AgentReviews.CLI do
                 last_message
               )
 
-              hint = codex_failure_hint(output)
+              hint = AgentReviews.AgentAdapter.failure_hint(agent_type, output)
               {:error, "Agent exited with status #{status} (see #{responses_md}).#{hint}"}
           end
         else
-          {:error, msg} -> {:error, msg}
+          {:error, :unknown} ->
+            {:error,
+             "Unknown agent type for AGENT_CMD=#{inspect(agent_cmd_in)} (supported: codex, claude).\nIf you’re using Claude Code, set `AGENT_CMD=claude`.\nIf you’re using Codex, set `AGENT_CMD=codex`."}
+
+          {:error, msg} ->
+            {:error, msg}
         end
     end
   end
@@ -583,29 +588,69 @@ defmodule AgentReviews.CLI do
     end
   end
 
-  defp run_agent_capture(root, agent_cmd, agent_args, prompt) do
-    tmp_last = tmp_path("agent_reviews_last_message", ".md")
-
-    args =
-      ["exec", "-C", Path.expand(root), "--output-last-message", tmp_last] ++ agent_args ++ ["-"]
-
-    {out, status} =
-      run_with_spinner("Running agent", fn ->
-        System.cmd(agent_cmd, args, cd: root, stderr_to_stdout: true, input: prompt)
-      end)
-
-    last_message =
-      case File.read(tmp_last) do
-        {:ok, s} -> String.trim_trailing(s)
-        _ -> ""
+  defp run_agent_capture(root, agent_cmd, agent_type, agent_args, opts, prompt) do
+    tmp_last =
+      case agent_type do
+        :codex -> tmp_path("agent_reviews_last_message", ".md")
+        _ -> nil
       end
 
-    _ = File.rm(tmp_last)
+    with {:ok, args} <-
+           AgentReviews.AgentAdapter.build_exec_args(
+             agent_type,
+             root,
+             tmp_last,
+             agent_args,
+             opts
+           ) do
+      {out, status} =
+        run_with_spinner("Running agent", fn ->
+          # Merge stderr into stdout so failures are captured into our debug output.
+          #
+          # For Claude, stdout is typically a single JSON object (via --output-format json); if stderr
+          # gets merged in, we still try to decode the last JSON-looking line.
+          System.cmd(
+            agent_cmd,
+            args,
+            cd: root,
+            stderr_to_stdout: true,
+            input: prompt
+          )
+        end)
 
-    if status == 0 do
-      {:ok, %{output: out, last_message: last_message}}
-    else
-      {:error, %{status: status, output: out, last_message: last_message}}
+      {last_message, cleanup_tmp?, status} =
+        case agent_type do
+          :codex ->
+            msg =
+              case File.read(tmp_last) do
+                {:ok, s} -> String.trim_trailing(s)
+                _ -> ""
+              end
+
+            {msg, true, status}
+
+          :claude ->
+            trimmed = String.trim_trailing(out)
+
+            case AgentReviews.AgentAdapter.claude_result_from_output(trimmed) do
+              {:ok, %{result: result, is_error?: true}} ->
+                {String.trim_trailing(result), false, if(status == 0, do: 1, else: status)}
+
+              {:ok, %{result: result, is_error?: false}} ->
+                {String.trim_trailing(result), false, status}
+
+              :error ->
+                {trimmed, false, status}
+            end
+        end
+
+      if cleanup_tmp? and is_binary(tmp_last), do: _ = File.rm(tmp_last)
+
+      if status == 0 do
+        {:ok, %{output: out, last_message: last_message}}
+      else
+        {:error, %{status: status, output: out, last_message: last_message}}
+      end
     end
   end
 
@@ -686,35 +731,6 @@ defmodule AgentReviews.CLI do
 
   defp spinner_enabled? do
     IO.ANSI.enabled?() and System.get_env("TERM", "dumb") != "dumb"
-  end
-
-  defp codex_args_from_opts(opts) when is_map(opts) do
-    model_args =
-      case Map.get(opts, :model) do
-        m when is_binary(m) and m != "" -> ["--model", m]
-        _ -> []
-      end
-
-    reasoning_args =
-      case Map.get(opts, :reasoning_effort) do
-        r when is_binary(r) and r != "" ->
-          ["--config", ~s(reasoning_effort=#{toml_string(r)})]
-
-        _ ->
-          []
-      end
-
-    model_args ++ reasoning_args
-  end
-
-  defp toml_string(value) do
-    escaped =
-      value
-      |> to_string()
-      |> String.replace("\\", "\\\\")
-      |> String.replace("\"", "\\\"")
-
-    ~s("#{escaped}")
   end
 
   defp print_run_summary(root, fetch_ctx, apply_ctx, commit_ctx, opts) do
@@ -866,10 +882,9 @@ defmodule AgentReviews.CLI do
     case System.find_executable(cmd) do
       nil ->
         {:error,
-         "Codex CLI not found ('#{cmd}'). Install Codex CLI and/or set AGENT_CMD to the correct executable."}
+         "Agent CLI not found ('#{cmd}'). Install Codex (`codex`) or Claude Code (`claude`), or set AGENT_CMD to the correct executable."}
 
       path ->
-        # If this looks like an asdf shim and is failing with "No preset version", try to find a non-shim codex.
         {out, status} = System.cmd(path, ["--help"], stderr_to_stdout: true)
 
         if status != 0 and String.contains?(out, "No preset version installed for command codex") do
@@ -879,10 +894,10 @@ defmodule AgentReviews.CLI do
 
             :error ->
               {:error,
-               "Your shell is resolving `codex` to an asdf shim, but it isn't runnable here.\nRun `which codex` and either install Codex CLI properly or set `AGENT_CMD` to the real Codex executable path.\n\nOutput:\n#{out}"}
+               "Your shell is resolving `codex` to an asdf shim, but it isn't runnable here.\nRun `which codex` and either install Codex CLI properly or set AGENT_CMD to the real Codex executable path.\n\nOutput:\n#{out}"}
           end
         else
-          {:ok, cmd}
+          {:ok, path}
         end
     end
   end
@@ -908,40 +923,6 @@ defmodule AgentReviews.CLI do
     |> String.split(":", trim: true)
     |> Enum.reject(&String.contains?(&1, ".asdf/shims"))
     |> Enum.map(&Path.join(&1, "codex"))
-  end
-
-  defp codex_failure_hint(output) when is_binary(output) do
-    cond do
-      String.contains?(output, "stdin is not a terminal") ->
-        "\nHint: your Codex invocation is running in interactive mode; ensure `codex exec` is available and being used."
-
-      String.contains?(output, "Codex cannot access session files") or
-          (String.contains?(output, "permission denied") and
-             String.contains?(output, ".codex/sessions")) ->
-        "\nHint: Codex cannot write to `~/.codex/sessions`. Fix ownership/permissions of `~/.codex` (Codex often suggests: `sudo chown -R $(whoami) ~/.codex`)."
-
-      true ->
-        ""
-    end
-  end
-
-  defp maybe_add_full_auto(args, full_auto?) when is_list(args) do
-    if full_auto? != true do
-      args
-    else
-      has_policy? =
-        Enum.any?(args, fn
-          "--full-auto" -> true
-          "--dangerously-bypass-approvals-and-sandbox" -> true
-          "--sandbox" -> true
-          "-s" -> true
-          "--ask-for-approval" -> true
-          "-a" -> true
-          _ -> false
-        end)
-
-      if has_policy?, do: args, else: ["--full-auto" | args]
-    end
   end
 
   defp run_post(root, pr_ref, opts) do
@@ -1926,17 +1907,6 @@ defmodule AgentReviews.CLI do
 
         Map.put(acc, tid, entry)
       end)
-    end
-  end
-
-  defp ensure_agent_noninteractive(agent_cmd) do
-    {out, status} = System.cmd(agent_cmd, ["exec", "--help"], stderr_to_stdout: true)
-
-    if status == 0 do
-      :ok
-    else
-      {:error,
-       "Your Codex CLI must support `codex exec` for non-interactive runs.\n\nTried: #{agent_cmd} exec --help\n\nOutput:\n#{out}\n\nHint: upgrade Codex CLI, or set AGENT_CMD to the correct Codex executable."}
     end
   end
 
