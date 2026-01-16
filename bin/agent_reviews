@@ -16,6 +16,20 @@ resolve_bin_dir() {
 
 BIN_DIR="$(resolve_bin_dir)"
 TOOL_DIR="$(cd "$BIN_DIR/.." >/dev/null 2>&1 && pwd)"
+ORIG_CWD="$(pwd)"
+
+has_repo_arg=false
+for a in "$@"; do
+  if [[ "$a" == "-C" || "$a" == "--repo" ]]; then
+    has_repo_arg=true
+    break
+  fi
+done
+
+ARGS=("$@")
+if [[ "$has_repo_arg" == "false" ]]; then
+  ARGS=("-C" "$ORIG_CWD" "${ARGS[@]}")
+fi
 
 # Used by the Elixir script to print the correct command name in summaries.
 export AGENT_REVIEWS_INVOKE="${AGENT_REVIEWS_INVOKE:-$(basename "$0")}"
@@ -41,10 +55,9 @@ if [[ "$ELIXIR_BIN" == "/opt/homebrew/bin/elixir" ]]; then
   export PATH="/opt/homebrew/bin:/opt/homebrew/opt/erlang/bin:${PATH}"
 fi
 
-cd "$TOOL_DIR"
-
 if [[ -x "$TOOL_DIR/agent_reviews" ]]; then
-  exec "$TOOL_DIR/agent_reviews" "$@"
+  exec "$TOOL_DIR/agent_reviews" "${ARGS[@]}"
 fi
 
-exec "$ELIXIR_BIN" -S mix run -e 'AgentReviews.CLI.main(System.argv())' -- "$@"
+cd "$TOOL_DIR"
+exec "$ELIXIR_BIN" -S mix run -e 'AgentReviews.CLI.main(System.argv())' -- "${ARGS[@]}"
