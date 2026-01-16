@@ -1,1 +1,6 @@
 .agent/
+erl_crash.dump
+/_build/
+/deps/
+/.elixir_ls/
+/.lexical/

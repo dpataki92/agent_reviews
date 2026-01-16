@@ -16,15 +16,9 @@ resolve_bin_dir() {
 
 BIN_DIR="$(resolve_bin_dir)"
 TOOL_DIR="$(cd "$BIN_DIR/.." >/dev/null 2>&1 && pwd)"
-SCRIPT="$TOOL_DIR/scripts/codex_reviews.exs"
-
-if [[ ! -f "$SCRIPT" ]]; then
-  echo "ERROR: Missing $SCRIPT" >&2
-  exit 1
-fi
 
 # Used by the Elixir script to print the correct command name in summaries.
-export CODEX_REVIEWS_INVOKE="${CODEX_REVIEWS_INVOKE:-$(basename "$0")}" 
+export AGENT_REVIEWS_INVOKE="${AGENT_REVIEWS_INVOKE:-$(basename "$0")}"
 
 # Prefer Homebrew Elixir if present.
 ELIXIR_BIN=""
@@ -47,4 +41,10 @@ if [[ "$ELIXIR_BIN" == "/opt/homebrew/bin/elixir" ]]; then
   export PATH="/opt/homebrew/bin:/opt/homebrew/opt/erlang/bin:${PATH}"
 fi
 
-exec "$ELIXIR_BIN" "$SCRIPT" "$@"
+cd "$TOOL_DIR"
+
+if [[ -x "$TOOL_DIR/agent_reviews" ]]; then
+  exec "$TOOL_DIR/agent_reviews" "$@"
+fi
+
+exec "$ELIXIR_BIN" -S mix run -e 'AgentReviews.CLI.main(System.argv())' -- "$@"

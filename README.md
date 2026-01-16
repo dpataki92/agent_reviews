@@ -13,12 +13,17 @@ Option B (PATH):
 
 - Add `/path/to/agent-reviews/bin` to your PATH.
 
+First run (once, in this repo):
+
+- `mix deps.get`
+- Optional (faster startup): `mix escript.build` (creates `./agent_reviews`)
+
 ## Prerequisites
 
+- `elixir` (includes `mix`)
 - `git`
 - `gh` (authenticated via `gh auth login`)
-- `codex` (Codex CLI; set `AGENT_CMD`/`CODEX_CMD` if it’s not on PATH)
-- Optional but recommended for robust JSON validation: `jq` or `python3`
+- `codex` (Codex CLI; set `AGENT_CMD` if it’s not on PATH)
 
 ## Usage
 
@@ -81,14 +86,14 @@ checkout_default = true
 
 You can also use env vars:
 
-- `AGENT_CMD` / `CODEX_CMD`
-- `AGENT_ARGS` / `CODEX_ARGS`
+- `AGENT_CMD`
+- `AGENT_ARGS`
 
 Run `agent_reviews config` to see effective settings.
 
 ## Notes
 
-- `apply` requires a clean working tree and validates your current HEAD contains the PR head commit recorded in `.agent/tasks.yaml` (branch-name mismatch is a warning).
+- `apply` requires a clean working tree and validates your current HEAD contains the PR head commit recorded in `.agent/tasks.json` (branch-name mismatch is a warning).
 - Posting expects a final fenced ```json block at the end of `.agent/review_responses.md`.
 
 ## Local-only ignore for artifacts
