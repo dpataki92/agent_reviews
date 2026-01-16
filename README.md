@@ -52,6 +52,10 @@ If present in the target repo root (committable), these are injected into the ag
 - `.agent_reviews_guidelines.md` (freeform markdown guidance)
 - `.agent_reviews_always_read.txt` (one repo-relative path per line; files the agent should read before acting)
 
+`@include` support:
+
+- In `.agent_reviews_guidelines.md`, you can add lines like `@include path/to/file.md` (or quoted) to inline other files (with a small depth/size limit).
+
 ## Checkout behavior
 
 - `run` auto-checks out the PR branch via `gh pr checkout`.

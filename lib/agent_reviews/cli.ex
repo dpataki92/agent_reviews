@@ -2015,26 +2015,146 @@ defmodule AgentReviews.CLI do
 
     Enum.find_value(candidates, {nil, nil}, fn path ->
       if File.regular?(path) and File.exists?(path) do
-        case File.read(path) do
-          {:ok, content} ->
-            content = String.trim_trailing(content)
+        {content, warnings} = read_guidelines_with_includes(path)
 
-            max_chars = 24_000
+        content =
+          if warnings == [] do
+            content
+          else
+            warnings_md =
+              warnings
+              |> Enum.uniq()
+              |> Enum.map(fn w -> "- " <> w <> "\n" end)
+              |> IO.iodata_to_binary()
 
-            content =
-              if String.length(content) > max_chars do
-                String.slice(content, 0, max_chars) <> "\n\n_(truncated)_"
-              else
-                content
-              end
+            "Warnings while expanding `@include`:\n\n" <> warnings_md <> "\n" <> content
+          end
 
-            {path, content}
-
-          _ ->
-            nil
-        end
+        {path, content}
       end
     end)
+  end
+
+  defp read_guidelines_with_includes(path) when is_binary(path) do
+    max_depth = 5
+    max_chars = 24_000
+
+    {content, warnings} =
+      do_read_guidelines_with_includes(Path.expand(path), max_depth, MapSet.new())
+
+    content = String.trim_trailing(content)
+
+    content =
+      if String.length(content) > max_chars do
+        String.slice(content, 0, max_chars) <> "\n\n_(truncated)_"
+      else
+        content
+      end
+
+    {content, warnings}
+  end
+
+  defp do_read_guidelines_with_includes(_path, depth, _seen) when depth < 0 do
+    {"", ["Include depth limit reached (max_depth=5)."]}
+  end
+
+  defp do_read_guidelines_with_includes(path, depth, seen) do
+    path = Path.expand(path)
+
+    cond do
+      MapSet.member?(seen, path) ->
+        {"", ["Include cycle detected: `#{path}`"]}
+
+      not File.exists?(path) ->
+        {"", ["Missing include: `#{path}`"]}
+
+      not File.regular?(path) ->
+        {"", ["Include is not a regular file: `#{path}`"]}
+
+      true ->
+        seen = MapSet.put(seen, path)
+
+        case File.read(path) do
+          {:ok, content} ->
+            if not String.valid?(content) do
+              {"", ["Include is not valid UTF-8: `#{path}`"]}
+            else
+              base_dir = Path.dirname(path)
+
+              {out, warnings} =
+                content
+                |> String.split(["\r\n", "\n", "\r"], trim: false)
+                |> Enum.reduce({[], []}, fn line, {acc, warns} ->
+                  case parse_include_line(line) do
+                    nil ->
+                      {[line | acc], warns}
+
+                    include_target ->
+                      resolved = resolve_include_path(include_target, base_dir)
+
+                      {included, more_warns} =
+                        do_read_guidelines_with_includes(resolved, depth - 1, seen)
+
+                      marker =
+                        [
+                          "<!-- begin include: ",
+                          include_target,
+                          " (",
+                          resolved,
+                          ") -->\n",
+                          included,
+                          if(String.trim(included) == "", do: "", else: "\n"),
+                          "<!-- end include: ",
+                          include_target,
+                          " -->"
+                        ]
+                        |> IO.iodata_to_binary()
+
+                      {[marker | acc], warns ++ more_warns}
+                  end
+                end)
+
+              {out |> Enum.reverse() |> Enum.join("\n"), warnings}
+            end
+
+          {:error, _} ->
+            {"", ["Failed to read include: `#{path}`"]}
+        end
+    end
+  end
+
+  defp parse_include_line(line) when is_binary(line) do
+    trimmed = String.trim(line)
+
+    case Regex.run(~r/^\s*@include\s+(.+?)\s*$/i, trimmed) do
+      [_, rest] ->
+        rest
+        |> String.trim()
+        |> String.trim_leading("`")
+        |> String.trim_trailing("`")
+        |> String.trim_leading("\"")
+        |> String.trim_trailing("\"")
+        |> String.trim()
+        |> then(fn s -> if(s == "", do: nil, else: s) end)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp resolve_include_path(target, base_dir) when is_binary(target) and is_binary(base_dir) do
+    target = String.trim(target)
+
+    cond do
+      target == "" ->
+        base_dir
+
+      Path.type(target) == :absolute ->
+        Path.expand(target)
+
+      true ->
+        Path.expand(Path.join(base_dir, target))
+    end
   end
 
   defp load_always_read_paths(root, common_root) do
