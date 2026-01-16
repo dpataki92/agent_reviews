@@ -1,5 +1,6 @@
 defmodule AgentReviews.CLI do
   @agent_dir ".agent_review"
+  @agent_timeout_ms 2 * 60 * 60 * 1000
 
   def main(argv) when is_list(argv) do
     {opts, argv} = parse_opts(argv)
@@ -232,7 +233,7 @@ defmodule AgentReviews.CLI do
 
             posting_metadata = detect_posting_metadata(root, apply_ctx.responses_md)
 
-            _ =
+            warn_state_write_error(
               update_pr_state_after_run(
                 state_root,
                 pr_number,
@@ -243,7 +244,9 @@ defmodule AgentReviews.CLI do
                 diff,
                 final_meta,
                 posting_metadata
-              )
+              ),
+              "Failed to persist run history"
+            )
 
             apply_ctx = Map.put(apply_ctx, :posting_metadata, posting_metadata)
             print_run_summary(root, fetch_ctx, apply_ctx, commit_ctx, opts)
@@ -259,6 +262,17 @@ defmodule AgentReviews.CLI do
   defp halt_on_error({:error, msg}) when is_binary(msg) do
     IO.puts(:stderr, "ERROR: #{msg}")
     System.halt(1)
+  end
+
+  defp warn_state_write_error(:ok, _context), do: :ok
+
+  defp warn_state_write_error({:error, msg}, context) do
+    IO.puts(
+      :stderr,
+      "WARN: #{context}: #{msg}\nWARN: Rerunning `post` may repost already-posted replies."
+    )
+
+    :ok
   end
 
   defp usage(invoke) do
@@ -384,9 +398,23 @@ defmodule AgentReviews.CLI do
        when is_integer(pr_number) and is_map(state) do
     with :ok <- ensure_agent_dir(state_root) do
       path = pr_state_path(state_root, pr_number)
-      File.mkdir_p!(Path.dirname(path))
-      File.write!(path, Jason.encode!(state, pretty: true) <> "\n")
-      :ok
+      dir = Path.dirname(path)
+
+      with :ok <- mkdir_p(dir) do
+        encoded = Jason.encode!(state, pretty: true) <> "\n"
+        tmp = path <> ".tmp." <> tmp_token()
+
+        with :ok <- write_file(tmp, encoded) do
+          case File.rename(tmp, path) do
+            :ok ->
+              :ok
+
+            {:error, _} ->
+              _ = File.rm(tmp)
+              write_file(path, encoded)
+          end
+        end
+      end
     end
   end
 
@@ -495,11 +523,12 @@ defmodule AgentReviews.CLI do
 
       true ->
         agent_cmd_in = Map.get(opts, :agent_cmd, "codex")
-        agent_args = shellwords(Map.get(opts, :agent_args, "")) ++ codex_args_from_opts(opts)
-        agent_args = maybe_add_full_auto(agent_args, true)
-        prompt = agent_prompt_template(opts, agent_tasks_json_path, root)
 
-        with :ok <- ensure_on_recorded_pr_head(root, recorded_tasks_json_path),
+        with {:ok, split_args} <- split_agent_args(Map.get(opts, :agent_args, "")),
+             agent_args <- split_args ++ codex_args_from_opts(opts),
+             agent_args <- maybe_add_full_auto(agent_args, true),
+             prompt <- agent_prompt_template(opts, agent_tasks_json_path, root),
+             :ok <- ensure_on_recorded_pr_head(root, recorded_tasks_json_path),
              {:ok, agent_cmd} <- resolve_agent_cmd(agent_cmd_in),
              :ok <- ensure_agent_noninteractive(agent_cmd) do
           if agent_cmd != agent_cmd_in do
@@ -539,6 +568,21 @@ defmodule AgentReviews.CLI do
     end
   end
 
+  defp split_agent_args(raw) do
+    raw = raw |> to_string() |> String.trim()
+
+    if raw == "" do
+      {:ok, []}
+    else
+      try do
+        {:ok, OptionParser.split(raw)}
+      rescue
+        e in OptionParser.ParseError ->
+          {:error, "Invalid AGENT_ARGS: #{Exception.message(e)}"}
+      end
+    end
+  end
+
   defp run_agent_capture(root, agent_cmd, agent_args, prompt) do
     tmp_last = tmp_path("agent_reviews_last_message", ".md")
 
@@ -566,8 +610,35 @@ defmodule AgentReviews.CLI do
   end
 
   defp tmp_path(prefix, suffix) do
-    name = "#{prefix}-#{System.unique_integer([:positive])}#{suffix}"
+    name = "#{prefix}-#{tmp_token()}#{suffix}"
     Path.join(System.tmp_dir!(), name)
+  end
+
+  defp tmp_token do
+    :crypto.strong_rand_bytes(12)
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp write_file(path, content) when is_binary(path) and is_binary(content) do
+    case File.write(path, content) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "Failed to write #{path} (#{inspect(reason)})"}
+    end
+  end
+
+  defp mkdir_p(dir) when is_binary(dir) do
+    case File.mkdir_p(dir) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "Failed to create directory #{dir} (#{inspect(reason)})"}
+    end
+  end
+
+  defp map_get_any(map, key1, key2, default \\ nil)
+       when is_map(map) and (is_atom(key1) or is_binary(key1)) and is_binary(key2) do
+    case Map.get(map, key1, nil) do
+      nil -> Map.get(map, key2, default)
+      v -> v
+    end
   end
 
   defp run_with_spinner(label, fun) when is_function(fun, 0) do
@@ -575,24 +646,41 @@ defmodule AgentReviews.CLI do
       frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
       task = Task.async(fun)
 
-      result = await_with_spinner(task, label, frames, 0)
-      IO.write("\r#{label}... done\n")
-      result
+      started_ms = System.monotonic_time(:millisecond)
+      result = await_with_spinner(task, label, frames, 0, started_ms, @agent_timeout_ms)
+
+      case result do
+        {:error, {:timeout, timeout_ms}} ->
+          mins = Float.round(timeout_ms / 60_000, 1)
+          IO.write("\r#{label}... timed out after #{mins} minutes\n")
+          {"ERROR: Agent timed out after #{mins} minutes.\n", 124}
+
+        _ ->
+          IO.write("\r#{label}... done\n")
+          result
+      end
     else
       IO.puts("#{label}...")
       fun.()
     end
   end
 
-  defp await_with_spinner(task, label, frames, idx) do
+  defp await_with_spinner(task, label, frames, idx, started_ms, timeout_ms) do
     case Task.yield(task, 120) do
       {:ok, result} ->
         result
 
       nil ->
-        frame = Enum.at(frames, rem(idx, length(frames)))
-        IO.write("\r#{label}... #{frame}")
-        await_with_spinner(task, label, frames, idx + 1)
+        elapsed = System.monotonic_time(:millisecond) - started_ms
+
+        if elapsed >= timeout_ms do
+          _ = Task.shutdown(task, :brutal_kill)
+          {:error, {:timeout, timeout_ms}}
+        else
+          frame = Enum.at(frames, rem(idx, length(frames)))
+          IO.write("\r#{label}... #{frame}")
+          await_with_spinner(task, label, frames, idx + 1, started_ms, timeout_ms)
+        end
     end
   end
 
@@ -884,12 +972,14 @@ defmodule AgentReviews.CLI do
 
                 case {replies_result, top_level_result} do
                   {{:ok, posted, posted_thread_ids}, :ok} ->
-                    _ =
+                    warn_state_write_error(
                       mark_replies_posted(
                         state_root(opts, root),
                         pr_number,
                         posted_thread_ids
-                      )
+                      ),
+                      "Failed to persist posted-replies state"
+                    )
 
                     {:ok,
                      %{
@@ -898,33 +988,39 @@ defmodule AgentReviews.CLI do
                      }}
 
                   {{:error, msg, posted_thread_ids}, :ok} ->
-                    _ =
+                    warn_state_write_error(
                       mark_replies_posted(
                         state_root(opts, root),
                         pr_number,
                         posted_thread_ids
-                      )
+                      ),
+                      "Failed to persist posted-replies state"
+                    )
 
                     {:error, msg}
 
                   {{:ok, posted, posted_thread_ids}, {:error, msg}} ->
-                    _ =
+                    warn_state_write_error(
                       mark_replies_posted(
                         state_root(opts, root),
                         pr_number,
                         posted_thread_ids
-                      )
+                      ),
+                      "Failed to persist posted-replies state"
+                    )
 
                     {:error,
                      "Posted #{posted} thread replies, but failed to post top-level comment.\n\n#{msg}"}
 
                   {{:error, msg1, posted_thread_ids}, {:error, msg2}} ->
-                    _ =
+                    warn_state_write_error(
                       mark_replies_posted(
                         state_root(opts, root),
                         pr_number,
                         posted_thread_ids
-                      )
+                      ),
+                      "Failed to persist posted-replies state"
+                    )
 
                     {:error, msg1 <> "\n\n" <> msg2}
                 end
@@ -1518,22 +1614,55 @@ defmodule AgentReviews.CLI do
   end
 
   defp split_agent_last_message(message) when is_binary(message) do
-    case Regex.run(
-           ~r/\A(.*)```[ \t]*(json|jsonc)[ \t]*\r?\n(.*?)\r?\n```[ \t]*\r?\n?\s*\z/si,
-           message,
-           capture: :all_but_first
-         ) do
-      [before, _lang, json] ->
-        body = before |> String.trim_trailing()
-        json = String.trim(json)
+    message = to_string(message)
 
-        case parse_posting_metadata_json(json) do
-          {:ok, decoded} -> {body, {:ok, decoded}}
-          {:error, reason} -> {message, {:error, reason}}
-        end
+    lines =
+      message
+      |> String.split(["\r\n", "\n", "\r"], trim: false)
+      |> Enum.reverse()
+      |> Enum.drop_while(fn l -> String.trim(l) == "" end)
+      |> Enum.reverse()
+
+    case lines do
+      [] ->
+        {message, {:error, "Missing final posting metadata JSON block."}}
 
       _ ->
-        {message, {:error, "Missing final posting metadata JSON block."}}
+        last_line = List.last(lines) |> to_string() |> String.trim()
+
+        if last_line != "```" do
+          {message, {:error, "Missing final posting metadata JSON block."}}
+        else
+          close_idx = length(lines) - 1
+
+          open_idx =
+            (close_idx - 1)..0//-1
+            |> Enum.find(fn i ->
+              line = Enum.at(lines, i) |> to_string() |> String.trim()
+              Regex.match?(~r/^```(json|jsonc)$/i, line)
+            end)
+
+          if is_integer(open_idx) do
+            body =
+              lines
+              |> Enum.take(open_idx)
+              |> Enum.join("\n")
+              |> String.trim_trailing()
+
+            json =
+              lines
+              |> Enum.slice(open_idx + 1, close_idx - open_idx - 1)
+              |> Enum.join("\n")
+              |> String.trim()
+
+            case parse_posting_metadata_json(json) do
+              {:ok, decoded} -> {body, {:ok, decoded}}
+              {:error, reason} -> {message, {:error, reason}}
+            end
+          else
+            {message, {:error, "Missing final posting metadata JSON block."}}
+          end
+        end
     end
   end
 
@@ -1870,23 +1999,23 @@ defmodule AgentReviews.CLI do
 
   defp task_to_json(t) do
     %{
-      "id" => Map.get(t, :id),
-      "thread_id" => Map.get(t, :thread_id, "") || "",
-      "path" => Map.get(t, :path, "") || "",
-      "line" => Map.get(t, :line, nil),
-      "diff_side" => Map.get(t, :diff_side, nil),
-      "type" => Map.get(t, :type, "change") || "change",
-      "author" => Map.get(t, :author, "unknown") || "unknown",
-      "created_at" => Map.get(t, :created_at, "") || "",
-      "comment_count" => Map.get(t, :comment_count, 0),
-      "comment_total_count" => Map.get(t, :comment_total_count, nil),
-      "comments_truncated" => Map.get(t, :comments_truncated, nil),
-      "ask_selected" => Map.get(t, :ask_selected, "latest") || "latest",
-      "ask_note" => Map.get(t, :ask_note, nil),
-      "thread_opener" => comment_to_json(Map.get(t, :thread_opener, %{})),
-      "latest_comment" => comment_to_json(Map.get(t, :latest_comment, %{})),
-      "body" => Map.get(t, :body, "") || "",
-      "all_comments" => all_comments_to_json(Map.get(t, :all_comments, nil))
+      "id" => map_get_any(t, :id, "id"),
+      "thread_id" => map_get_any(t, :thread_id, "thread_id", ""),
+      "path" => map_get_any(t, :path, "path", ""),
+      "line" => map_get_any(t, :line, "line"),
+      "diff_side" => map_get_any(t, :diff_side, "diff_side"),
+      "type" => map_get_any(t, :type, "type", "change"),
+      "author" => map_get_any(t, :author, "author", "unknown"),
+      "created_at" => map_get_any(t, :created_at, "created_at", ""),
+      "comment_count" => map_get_any(t, :comment_count, "comment_count", 0),
+      "comment_total_count" => map_get_any(t, :comment_total_count, "comment_total_count"),
+      "comments_truncated" => map_get_any(t, :comments_truncated, "comments_truncated"),
+      "ask_selected" => map_get_any(t, :ask_selected, "ask_selected", "latest"),
+      "ask_note" => map_get_any(t, :ask_note, "ask_note"),
+      "thread_opener" => comment_to_json(map_get_any(t, :thread_opener, "thread_opener", %{})),
+      "latest_comment" => comment_to_json(map_get_any(t, :latest_comment, "latest_comment", %{})),
+      "body" => map_get_any(t, :body, "body", ""),
+      "all_comments" => all_comments_to_json(map_get_any(t, :all_comments, "all_comments"))
     }
   end
 
@@ -1926,7 +2055,23 @@ defmodule AgentReviews.CLI do
       end
 
     common_root = Map.get(opts, :common_root, nil)
-    {guidelines_path, guidelines_md} = load_guidelines(root, common_root)
+
+    {guidelines_path, guidelines_md, include_warnings} =
+      AgentReviews.Guidelines.load(root, common_root)
+
+    guidelines_md =
+      if is_binary(guidelines_md) and include_warnings != [] do
+        warnings_md =
+          include_warnings
+          |> Enum.uniq()
+          |> Enum.map(fn w -> "- " <> w <> "\n" end)
+          |> IO.iodata_to_binary()
+
+        "Warnings while expanding `@include`:\n\n" <> warnings_md <> "\n" <> guidelines_md
+      else
+        guidelines_md
+      end
+
     {always_read_path, always_read} = load_always_read_paths(root, common_root)
 
     guidance_section =
@@ -2001,160 +2146,6 @@ defmodule AgentReviews.CLI do
     - `top_level_comment` may be an empty string if you don't want a top-level PR comment.
     - The JSON block must be the final fenced ```json block at the end of the file (no other JSON blocks after it).
     """
-  end
-
-  defp load_guidelines(root, common_root) do
-    candidates =
-      [root, common_root]
-      |> Enum.map(fn
-        nil -> nil
-        p -> Path.join(p, ".agent_reviews_guidelines.md")
-      end)
-      |> Enum.reject(&is_nil/1)
-      |> Enum.uniq()
-
-    Enum.find_value(candidates, {nil, nil}, fn path ->
-      if File.regular?(path) and File.exists?(path) do
-        {content, warnings} = read_guidelines_with_includes(path)
-
-        content =
-          if warnings == [] do
-            content
-          else
-            warnings_md =
-              warnings
-              |> Enum.uniq()
-              |> Enum.map(fn w -> "- " <> w <> "\n" end)
-              |> IO.iodata_to_binary()
-
-            "Warnings while expanding `@include`:\n\n" <> warnings_md <> "\n" <> content
-          end
-
-        {path, content}
-      end
-    end)
-  end
-
-  defp read_guidelines_with_includes(path) when is_binary(path) do
-    max_depth = 5
-    max_chars = 24_000
-
-    {content, warnings} =
-      do_read_guidelines_with_includes(Path.expand(path), max_depth, MapSet.new())
-
-    content = String.trim_trailing(content)
-
-    content =
-      if String.length(content) > max_chars do
-        String.slice(content, 0, max_chars) <> "\n\n_(truncated)_"
-      else
-        content
-      end
-
-    {content, warnings}
-  end
-
-  defp do_read_guidelines_with_includes(_path, depth, _seen) when depth < 0 do
-    {"", ["Include depth limit reached (max_depth=5)."]}
-  end
-
-  defp do_read_guidelines_with_includes(path, depth, seen) do
-    path = Path.expand(path)
-
-    cond do
-      MapSet.member?(seen, path) ->
-        {"", ["Include cycle detected: `#{path}`"]}
-
-      not File.exists?(path) ->
-        {"", ["Missing include: `#{path}`"]}
-
-      not File.regular?(path) ->
-        {"", ["Include is not a regular file: `#{path}`"]}
-
-      true ->
-        seen = MapSet.put(seen, path)
-
-        case File.read(path) do
-          {:ok, content} ->
-            if not String.valid?(content) do
-              {"", ["Include is not valid UTF-8: `#{path}`"]}
-            else
-              base_dir = Path.dirname(path)
-
-              {out, warnings} =
-                content
-                |> String.split(["\r\n", "\n", "\r"], trim: false)
-                |> Enum.reduce({[], []}, fn line, {acc, warns} ->
-                  case parse_include_line(line) do
-                    nil ->
-                      {[line | acc], warns}
-
-                    include_target ->
-                      resolved = resolve_include_path(include_target, base_dir)
-
-                      {included, more_warns} =
-                        do_read_guidelines_with_includes(resolved, depth - 1, seen)
-
-                      marker =
-                        [
-                          "<!-- begin include: ",
-                          include_target,
-                          " (",
-                          resolved,
-                          ") -->\n",
-                          included,
-                          if(String.trim(included) == "", do: "", else: "\n"),
-                          "<!-- end include: ",
-                          include_target,
-                          " -->"
-                        ]
-                        |> IO.iodata_to_binary()
-
-                      {[marker | acc], warns ++ more_warns}
-                  end
-                end)
-
-              {out |> Enum.reverse() |> Enum.join("\n"), warnings}
-            end
-
-          {:error, _} ->
-            {"", ["Failed to read include: `#{path}`"]}
-        end
-    end
-  end
-
-  defp parse_include_line(line) when is_binary(line) do
-    trimmed = String.trim(line)
-
-    case Regex.run(~r/^\s*@include\s+(.+?)\s*$/i, trimmed) do
-      [_, rest] ->
-        rest
-        |> String.trim()
-        |> String.trim_leading("`")
-        |> String.trim_trailing("`")
-        |> String.trim_leading("\"")
-        |> String.trim_trailing("\"")
-        |> String.trim()
-        |> then(fn s -> if(s == "", do: nil, else: s) end)
-
-      _ ->
-        nil
-    end
-  end
-
-  defp resolve_include_path(target, base_dir) when is_binary(target) and is_binary(base_dir) do
-    target = String.trim(target)
-
-    cond do
-      target == "" ->
-        base_dir
-
-      Path.type(target) == :absolute ->
-        Path.expand(target)
-
-      true ->
-        Path.expand(Path.join(base_dir, target))
-    end
   end
 
   defp load_always_read_paths(root, common_root) do
@@ -2350,53 +2341,6 @@ defmodule AgentReviews.CLI do
 
   defp parse_pr_ref(ref, root), do: AgentReviews.Repo.parse_pr_ref(ref, root)
 
-  # Shellwords splitting: supports spaces, single/double quotes, and backslash escapes (in normal/double quotes).
-  defp shellwords(""), do: []
-
-  defp shellwords(s) do
-    s
-    |> String.trim()
-    |> do_shellwords([], "", :normal, false)
-    |> Enum.reverse()
-  end
-
-  defp do_shellwords(<<>>, acc, "", _mode, _escape), do: acc
-  defp do_shellwords(<<>>, acc, token, _mode, _escape), do: [token | acc]
-
-  defp do_shellwords(<<"\\", rest::binary>>, acc, token, :single, false),
-    do: do_shellwords(rest, acc, token <> "\\", :single, false)
-
-  defp do_shellwords(<<"\\", rest::binary>>, acc, token, mode, false)
-       when mode in [:normal, :double],
-       do: do_shellwords(rest, acc, token, mode, true)
-
-  defp do_shellwords(<<char::utf8, rest::binary>>, acc, token, mode, true),
-    do: do_shellwords(rest, acc, token <> <<char::utf8>>, mode, false)
-
-  defp do_shellwords(<<"\"", rest::binary>>, acc, token, :normal, false),
-    do: do_shellwords(rest, acc, token, :double, false)
-
-  defp do_shellwords(<<"\"", rest::binary>>, acc, token, :double, false),
-    do: do_shellwords(rest, acc, token, :normal, false)
-
-  defp do_shellwords(<<"'", rest::binary>>, acc, token, :normal, false),
-    do: do_shellwords(rest, acc, token, :single, false)
-
-  defp do_shellwords(<<"'", rest::binary>>, acc, token, :single, false),
-    do: do_shellwords(rest, acc, token, :normal, false)
-
-  defp do_shellwords(<<char::utf8, rest::binary>>, acc, token, :normal, false)
-       when char in [?\s, ?\t, ?\n, ?\r] do
-    if token == "" do
-      do_shellwords(rest, acc, "", :normal, false)
-    else
-      do_shellwords(rest, [token | acc], "", :normal, false)
-    end
-  end
-
-  defp do_shellwords(<<char::utf8, rest::binary>>, acc, token, mode, false),
-    do: do_shellwords(rest, acc, token <> <<char::utf8>>, mode, false)
-
   # Posting metadata parsing (stdlib-only JSON parser)
   defp extract_posting_metadata(content, _root) do
     with {:ok, block} <- extract_final_json_fence(content),
@@ -2412,21 +2356,57 @@ defmodule AgentReviews.CLI do
   end
 
   defp extract_final_json_fence(content) when is_binary(content) do
-    case Regex.run(
-           ~r/```[ \t]*(json|jsonc)[ \t]*\r?\n(.*?)\r?\n```[ \t]*\r?\n?\s*\z/si,
-           content,
-           capture: :all_but_first
-         ) do
-      [lang, body] when is_binary(lang) and is_binary(body) ->
-        {:ok, String.trim(body)}
+    lines =
+      content
+      |> String.split(["\r\n", "\n", "\r"], trim: false)
+      |> Enum.reverse()
+      |> Enum.drop_while(fn l -> String.trim(l) == "" end)
+      |> Enum.reverse()
+
+    has_any_json_fence? =
+      Enum.any?(lines, fn line ->
+        line = to_string(line) |> String.trim()
+        Regex.match?(~r/^```(json|jsonc)\b/i, line)
+      end)
+
+    case lines do
+      [] ->
+        {:error,
+         "Could not find a JSON posting metadata code block (```json ... ```) in `#{@agent_dir}/review_responses.md`."}
 
       _ ->
-        if Regex.match?(~r/```[ \t]*(json|jsonc)[ \t]*\r?\n/si, content) do
-          {:error,
-           "Found a JSON code block, but posting metadata must be the FINAL fenced ```json block at the end of `#{@agent_dir}/review_responses.md`."}
+        last_line = List.last(lines) |> to_string() |> String.trim()
+
+        if last_line != "```" do
+          if has_any_json_fence? do
+            {:error,
+             "Found a JSON code block, but posting metadata must be the FINAL fenced ```json block at the end of `#{@agent_dir}/review_responses.md`."}
+          else
+            {:error,
+             "Could not find a JSON posting metadata code block (```json ... ```) in `#{@agent_dir}/review_responses.md`."}
+          end
         else
-          {:error,
-           "Could not find a JSON posting metadata code block (```json ... ```) in `#{@agent_dir}/review_responses.md`."}
+          close_idx = length(lines) - 1
+
+          open_idx =
+            (close_idx - 1)..0//-1
+            |> Enum.find(fn i ->
+              line = Enum.at(lines, i) |> to_string() |> String.trim()
+              Regex.match?(~r/^```(json|jsonc)$/i, line)
+            end)
+
+          if is_integer(open_idx) do
+            body =
+              lines
+              |> Enum.slice(open_idx + 1, close_idx - open_idx - 1)
+              |> Enum.join("\n")
+              |> String.trim()
+
+            {:ok, body}
+          else
+            {:error,
+             "Found a JSON code block, but posting metadata must be the FINAL fenced ```json block at the end of `#{@agent_dir}/review_responses.md`."}
+          end
         end
     end
   end

@@ -5,7 +5,7 @@ defmodule AgentReviews.Config do
       reasoning_effort: nil
     }
 
-    user_cfg_path = Path.join(System.user_home!(), ".agent_reviews.toml")
+    user_cfg_path = Path.join(user_home!(), ".agent_reviews.toml")
     repo_cfg_path = Path.join(root, ".agent_reviews.toml")
 
     with {:ok, user_cfg} <- read_optional_config(user_cfg_path),
@@ -16,6 +16,16 @@ defmodule AgentReviews.Config do
         |> Map.merge(repo_cfg)
 
       {:ok, apply_config_to_opts(opts, apply_env_overrides(cfg))}
+    end
+  end
+
+  defp user_home! do
+    home = System.get_env("HOME")
+
+    if is_binary(home) and String.trim(home) != "" do
+      home
+    else
+      System.user_home!()
     end
   end
 
@@ -138,10 +148,54 @@ defmodule AgentReviews.Config do
   end
 
   defp toml_unescape(s) do
-    s
-    |> String.replace("\\\\", "\\")
-    |> String.replace("\\\"", "\"")
+    s = to_string(s)
+    do_toml_unescape(s, "")
   end
+
+  defp do_toml_unescape(<<>>, acc), do: acc
+
+  defp do_toml_unescape(<<"\\", rest::binary>>, acc) do
+    case rest do
+      <<"n", tail::binary>> ->
+        do_toml_unescape(tail, acc <> "\n")
+
+      <<"t", tail::binary>> ->
+        do_toml_unescape(tail, acc <> "\t")
+
+      <<"r", tail::binary>> ->
+        do_toml_unescape(tail, acc <> "\r")
+
+      <<"b", tail::binary>> ->
+        do_toml_unescape(tail, acc <> "\b")
+
+      <<"f", tail::binary>> ->
+        do_toml_unescape(tail, acc <> "\f")
+
+      <<"\\", tail::binary>> ->
+        do_toml_unescape(tail, acc <> "\\")
+
+      <<"\"", tail::binary>> ->
+        do_toml_unescape(tail, acc <> "\"")
+
+      <<"u", a::binary-size(4), tail::binary>> ->
+        case Integer.parse(a, 16) do
+          {codepoint, ""} when codepoint <= 0x10FFFF ->
+            do_toml_unescape(tail, acc <> <<codepoint::utf8>>)
+
+          _ ->
+            do_toml_unescape(tail, acc <> "\\u" <> a)
+        end
+
+      <<char::utf8, tail::binary>> ->
+        do_toml_unescape(tail, acc <> "\\" <> <<char::utf8>>)
+
+      _ ->
+        acc <> "\\"
+    end
+  end
+
+  defp do_toml_unescape(<<char::utf8, rest::binary>>, acc),
+    do: do_toml_unescape(rest, acc <> <<char::utf8>>)
 
   defp apply_config_to_opts(opts, cfg) do
     opts = Map.put(opts, :agent_cmd, Map.get(cfg, :agent_cmd, "codex"))
