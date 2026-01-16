@@ -326,21 +326,55 @@ defmodule AgentReviews.Repo do
   end
 
   defp infer_owner_repo_from_remote(root) do
-    case System.cmd("git", ["config", "--get", "remote.origin.url"],
-           cd: root,
-           stderr_to_stdout: true
-         ) do
-      {remote, 0} ->
-        case parse_github_remote(String.trim(remote)) do
-          {:ok, owner, repo} ->
-            {:ok, {owner, repo}}
+    candidates =
+      case System.cmd("git", ["remote"], cd: root, stderr_to_stdout: true) do
+        {out, 0} ->
+          remotes =
+            out
+            |> String.split(["\r\n", "\n", "\r"], trim: true)
+            |> Enum.map(&String.trim/1)
+            |> Enum.reject(&(&1 == ""))
 
-          :error ->
-            {:error, "Could not infer GitHub repo from remote.origin.url (pass a PR URL instead)"}
+          ["origin" | Enum.reject(remotes, &(&1 == "origin"))]
+
+        _ ->
+          ["origin"]
+      end
+
+    found =
+      Enum.find_value(candidates, fn name ->
+        case System.cmd("git", ["remote", "get-url", name], cd: root, stderr_to_stdout: true) do
+          {remote, 0} ->
+            remote = String.trim(remote)
+
+            case parse_github_remote(remote) do
+              {:ok, owner, repo} -> {:ok, {owner, repo, name, remote}}
+              :error -> nil
+            end
+
+          _ ->
+            nil
         end
+      end)
 
-      {out, _} ->
-        {:error, "Could not read remote.origin.url.\n\nOutput:\n#{out}"}
+    case found do
+      {:ok, {owner, repo, _name, _remote}} ->
+        {:ok, {owner, repo}}
+
+      nil ->
+        has_any_remote? =
+          case System.cmd("git", ["remote"], cd: root, stderr_to_stdout: true) do
+            {out, 0} -> String.trim(out) != ""
+            _ -> false
+          end
+
+        if has_any_remote? do
+          {:error,
+           "Could not infer GitHub repo from git remotes.\n\nFix:\n- Pass a PR URL: `https://github.com/<owner>/<repo>/pull/<n>`\n- Or pass `owner/repo#<n>`\n- Or add/rename a GitHub remote as `origin`.\n\nHint: run `git remote -v` in the target repo to see configured remotes."}
+        else
+          {:error,
+           "Could not infer GitHub repo because this repo has no git remotes configured.\n\nFix:\n- Run inside the target repo (or pass `-C /path/to/repo`).\n- Or pass a PR URL: `https://github.com/<owner>/<repo>/pull/<n>`\n- Or pass `owner/repo#<n>`\n\nHint: run `git remote -v` in the target repo."}
+        end
     end
   end
 
