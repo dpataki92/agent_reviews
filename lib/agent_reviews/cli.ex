@@ -595,6 +595,8 @@ defmodule AgentReviews.CLI do
         _ -> nil
       end
 
+    tmp_prompt = tmp_path("agent_reviews_prompt", ".md")
+
     with {:ok, args} <-
            AgentReviews.AgentAdapter.build_exec_args(
              agent_type,
@@ -602,20 +604,18 @@ defmodule AgentReviews.CLI do
              tmp_last,
              agent_args,
              opts
-           ) do
+           ),
+         :ok <- File.write(tmp_prompt, prompt) do
       {out, status} =
         run_with_spinner("Running agent", fn ->
-          # Merge stderr into stdout so failures are captured into our debug output.
-          #
-          # For Claude, stdout is typically a single JSON object (via --output-format json); if stderr
-          # gets merged in, we still try to decode the last JSON-looking line.
-          System.cmd(
-            agent_cmd,
-            args,
-            cd: root,
-            stderr_to_stdout: true,
-            input: prompt
-          )
+          cmd =
+            ["exec", sh_single_quote(agent_cmd)]
+            |> Kernel.++(Enum.map(args, &sh_single_quote/1))
+            |> Enum.join(" ")
+            |> Kernel.<>(" < ")
+            |> Kernel.<>(sh_single_quote(tmp_prompt))
+
+          System.cmd("sh", ["-c", cmd], cd: root, stderr_to_stdout: true)
         end)
 
       {last_message, cleanup_tmp?, status} =
@@ -645,6 +645,7 @@ defmodule AgentReviews.CLI do
         end
 
       if cleanup_tmp? and is_binary(tmp_last), do: _ = File.rm(tmp_last)
+      _ = File.rm(tmp_prompt)
 
       if status == 0 do
         {:ok, %{output: out, last_message: last_message}}
@@ -684,6 +685,11 @@ defmodule AgentReviews.CLI do
       nil -> Map.get(map, key2, default)
       v -> v
     end
+  end
+
+  defp sh_single_quote(value) do
+    value = to_string(value)
+    "'" <> String.replace(value, "'", "'\\''") <> "'"
   end
 
   defp run_with_spinner(label, fun) when is_function(fun, 0) do
