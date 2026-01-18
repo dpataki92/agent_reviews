@@ -2,6 +2,20 @@
 
 Local tool to turn unresolved GitHub PR review threads into actionable tasks, run an agent (default: Codex CLI) to implement/respond, and optionally post per-thread replies.
 
+The tool is designed to run **inside a target repo** (or with `-C /path/to/repo`). It writes all artifacts to the target repo under `.agent_review/` (not to this repo).
+
+## Quickstart
+
+From inside a target repo:
+
+- `agent_reviews run 12345` (or `agent_reviews 12345`)
+- Review `.agent_review/review_responses.md`
+- Optionally: `agent_reviews post 12345`
+
+With Claude Code:
+
+- `AGENT_CMD=claude agent_reviews run 12345`
+
 ## Install
 
 Option A (symlink):
@@ -13,10 +27,14 @@ Option B (PATH):
 
 - Add `/path/to/agent-reviews/bin` to your PATH.
 
-First run (once, in this repo):
+First run (once, in this repo; for development):
 
 - `mix deps.get`
 - Optional (faster startup): `mix escript.build` (creates `./agent_reviews`)
+
+Notes:
+
+- The `bin/agent_reviews` wrapper will automatically add `-C "$PWD"` unless you explicitly pass `-C/--repo`.
 
 ## Prerequisites
 
@@ -69,6 +87,14 @@ If you want to work on multiple PRs concurrently without `.agent_review/` confli
 
 This creates/uses a per-PR worktree under `<repo_root>/.worktrees/agent_reviews/pr-123` and runs the whole session there.
 
+## Concurrency / locking
+
+To avoid corrupted state or duplicate posts, `run`/`post` serialize access per PR using a lock file:
+
+- `<repo_root>/.agent_review/state/locks/pr-<n>.lock`
+
+If you see a lock error and you’re sure nothing is running, delete the lock file and retry.
+
 ## Config
 
 Optional config files (simple TOML subset):
@@ -97,6 +123,7 @@ Claude notes:
 
 - Set `AGENT_CMD=claude` to use Claude Code CLI.
 - Runs use `claude -p --output-format json --no-session-persistence` by default (non-interactive and robust output capture).
+- Claude Code must be authenticated (e.g. `claude setup-token` or interactive `/login`).
 - `reasoning_effort` doesn’t map to a native Claude Code flag; it’s injected as a lightweight system hint only.
 
 Examples:
