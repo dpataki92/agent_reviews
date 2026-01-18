@@ -1,147 +1,206 @@
 # agent-reviews
 
-Local tool to turn unresolved GitHub PR review threads into actionable tasks, run an agent (default: Codex CLI) to implement/respond, and optionally post per-thread replies.
+Automate GitHub PR review responses using AI agents (Codex CLI or Claude Code). Fetches unresolved review threads, runs an agent to address them, and optionally posts responses back to GitHub.
 
-The tool is designed to run **inside a target repo** (or with `-C /path/to/repo`). It writes all artifacts to the target repo under `.agent_review/` (not to this repo).
+## Installation
 
-## Quickstart
+```bash
+# 1. Clone this repo
+git clone <repo-url>
+cd agent-reviews
 
-From inside a target repo:
+# 2. Install dependencies
+mix deps.get
 
-- `agent_reviews run 12345` (or `agent_reviews 12345`)
-- Review `.agent_review/review_responses.md`
-- Optionally: `agent_reviews post 12345`
+# 3. Optional: Build for faster startup
+mix escript.build
 
-With Claude Code:
+# 4. Make available globally (choose one)
+# Option A: Symlink (recommended)
+ln -sf "$(pwd)/bin/agent_reviews" /opt/homebrew/bin/agent_reviews  # macOS (Homebrew)
+ln -sf "$(pwd)/bin/agent_reviews" /usr/local/bin/agent_reviews     # Linux or Intel Mac
 
-- `AGENT_CMD=claude agent_reviews run 12345`
+# Option B: Add to PATH
+echo 'export PATH="'$(pwd)'/bin:$PATH"' >> ~/.zshrc  # or ~/.bashrc
+```
 
-## Install
+### Prerequisites
 
-Option A (symlink):
-
-- `ln -sf /path/to/agent-reviews/bin/agent_reviews /opt/homebrew/bin/agent_reviews`  # Apple Silicon
-- `ln -sf /path/to/agent-reviews/bin/agent_reviews /usr/local/bin/agent_reviews`    # Intel
-
-Option B (PATH):
-
-- Add `/path/to/agent-reviews/bin` to your PATH.
-
-First run (once, in this repo; for development):
-
-- `mix deps.get`
-- Optional (faster startup): `mix escript.build` (creates `./agent_reviews`)
-
-Notes:
-
-- The `bin/agent_reviews` wrapper will automatically add `-C "$PWD"` unless you explicitly pass `-C/--repo`.
-
-## Prerequisites
-
-- `elixir` (includes `mix`)
-- `git`
-- `gh` (authenticated via `gh auth login`)
-- `codex` (Codex CLI) **or** `claude` (Claude Code CLI; set `AGENT_CMD` if it’s not on PATH)
+- `elixir` - [Install Elixir](https://elixir-lang.org/install.html)
+- `git` - Usually pre-installed
+- `gh` - [GitHub CLI](https://cli.github.com/), authenticated with `gh auth login`
+- **Agent CLI** (choose one):
+  - `codex` - [Codex CLI](https://codex.dev) (default)
+  - `claude` - [Claude Code CLI](https://claude.ai/code)
 
 ## Usage
 
-Run inside a target repo, or point at one:
+### Basic Commands
 
-- `agent_reviews <pr-number|pr-url|owner/repo#number> [--commit]` (shorthand for `run`)
-- `agent_reviews run <pr-number|pr-url|owner/repo#number> [--commit]`
-- `agent_reviews post <pr-number|pr-url>`
+```bash
+# Run in your project repo
+cd ~/projects/my-app
 
-Target a repo explicitly:
+# Address PR review feedback (by PR number)
+agent_reviews 123
 
-- `agent_reviews -C /path/to/repo run 12345`
+# Explicit run command
+agent_reviews run 123
 
-Outputs are written under the target repo’s `.agent_review/` directory:
+# Auto-commit changes
+agent_reviews run 123 --commit
 
-- `tasks.json`
-- `review_responses.md` (main user document)
-- `state/pr-<n>.json` (internal run history; used to show what’s new/changed since last run and avoid redoing work)
-
-Debug artifacts are only written on failures (e.g. agent logs, raw GitHub API pages).
-
-## Optional repo guidance
-
-If present in the target repo root (committable), these are injected into the agent prompt:
-
-- `.agent_reviews_guidelines.md` (freeform markdown guidance)
-- `.agent_reviews_always_read.txt` (one repo-relative path per line; files the agent should read before acting)
-
-`@include` support:
-
-- In `.agent_reviews_guidelines.md`, you can add lines like `@include path/to/file.md` (or quoted) to inline other files (with a small depth/size limit).
-
-## Checkout behavior
-
-- `run` auto-checks out the PR branch via `gh pr checkout`.
-- If the working tree is dirty, it refuses to start (clean it up first: commit/stash/reset).
-
-## Parallel PR sessions (worktrees)
-
-If you want to work on multiple PRs concurrently without `.agent_review/` conflicts, use git worktrees:
-
-- `agent_reviews run 123 --worktree`
-
-This creates/uses a per-PR worktree under `<repo_root>/.worktrees/agent_reviews/pr-123` and runs the whole session there.
-
-## Concurrency / locking
-
-To avoid corrupted state or duplicate posts, `run`/`post` serialize access per PR using a lock file:
-
-- `<repo_root>/.agent_review/state/locks/pr-<n>.lock`
-
-If you see a lock error and you’re sure nothing is running, delete the lock file and retry.
-
-## Config
-
-Optional config files (simple TOML subset):
-
-- User: `~/.agent_reviews.toml`
-- Repo: `<repo_root>/.agent_reviews.toml`
-
-Supported keys:
-
-- `model` (string)
-- `reasoning_effort` (string)
-
-Example:
-
-```toml
-model = "gpt-5.2"
-reasoning_effort = "high"
+# Post responses to GitHub
+agent_reviews post 123
 ```
 
-Escape hatch (env vars):
+### PR Reference Formats
 
-- `AGENT_CMD`
-- `AGENT_ARGS`
+```bash
+agent_reviews 123                                    # PR number (infers repo from git remote)
+agent_reviews https://github.com/owner/repo/pull/123 # Full URL
+agent_reviews owner/repo#123                         # owner/repo#number format
+agent_reviews -C /path/to/repo run 123               # Run from outside the repo
+```
 
-Claude notes:
+## Choosing Your Agent
 
-- Set `AGENT_CMD=claude` to use Claude Code CLI.
-- Runs use `claude -p --output-format json --no-session-persistence` by default (non-interactive and robust output capture).
-- Claude Code must be authenticated (e.g. `claude setup-token` or interactive `/login`).
-- `reasoning_effort` doesn’t map to a native Claude Code flag; it’s injected as a lightweight system hint only.
+### Using Codex (default)
 
-Examples:
+No configuration needed if `codex` is on your PATH:
 
-- `AGENT_CMD=claude agent_reviews 123`
-- `AGENT_CMD=claude agent_reviews run https://github.com/owner/repo/pull/123`
+```bash
+agent_reviews 123
+```
 
-## Notes
+### Using Claude Code
 
-- `run` requires a clean working tree and validates your current HEAD contains the PR head commit recorded in `.agent_review/tasks.json` (branch-name mismatch is a warning).
-- Posting expects a final fenced ```json block at the end of `.agent_review/review_responses.md`.
+Set `AGENT_CMD=claude`:
 
-## Local-only ignore for artifacts
+```bash
+# One-time
+AGENT_CMD=claude agent_reviews 123
 
-This tool writes runtime artifacts under `.agent_review/` in the target repo.
+# Permanently (add to ~/.zshrc or ~/.bashrc)
+export AGENT_CMD=claude
 
-On `run`/`post`, it attempts to add `.agent_review/` and `.worktrees/` to the repo-local exclude file (not committed): `.git/info/exclude`.
+# Then just run
+agent_reviews 123
+```
 
-If that fails (permissions/worktrees), add it manually:
+**Note:** Claude Code must be authenticated. Run `claude setup-token` or start `claude` interactively and use `/login`.
 
-- `EXCLUDE=$(git rev-parse --git-path info/exclude) && printf '\n# agent_reviews (local-only)\n.agent_review/\n.worktrees/\n' >> "$EXCLUDE"`
+## Configuration
+
+### Optional Config Files
+
+Create `~/.agent_reviews.toml` (user-level) or `.agent_reviews.toml` (repo-level):
+
+```toml
+model = "claude-opus-4"              # Override default model
+reasoning_effort = "high"            # Adjust reasoning depth
+```
+
+### Environment Variables
+
+```bash
+export AGENT_CMD=claude              # Agent to use (codex or claude)
+export AGENT_ARGS="--model gpt-4"    # Additional agent arguments
+```
+
+## Output Files
+
+After running, check `.agent_review/` in your target repo:
+
+- **`review_responses.md`** - Agent's responses (review this first)
+- **`tasks.json`** - Structured task data
+- **`state/pr-<n>.json`** - Run history (tracks what's changed since last run)
+
+## Common Options
+
+```bash
+--commit                  # Auto-commit changes made by agent
+--worktree                # Use git worktree for parallel PR work
+--model MODEL             # Override model (e.g., --model gpt-4)
+--reasoning-effort LEVEL  # Set reasoning effort (low/medium/high)
+-C /path/to/repo          # Target a different repo
+```
+
+## Advanced Features
+
+### Repo-Specific Guidance
+
+Create these files in your target repo to guide the agent:
+
+**`.agent_reviews_guidelines.md`** - Custom instructions for the agent:
+```markdown
+# Project Guidelines
+- Always run tests after changes
+- Follow error handling patterns in src/errors.rs
+@include docs/style-guide.md
+```
+
+**`.agent_reviews_always_read.txt`** - Files the agent should read first:
+```
+CONTRIBUTING.md
+ARCHITECTURE.md
+docs/api-guide.md
+```
+
+### Parallel PR Work
+
+Use worktrees to work on multiple PRs simultaneously:
+
+```bash
+# Terminal 1
+agent_reviews 123 --worktree  # Creates .worktrees/agent_reviews/pr-123/
+
+# Terminal 2
+agent_reviews 456 --worktree  # Creates .worktrees/agent_reviews/pr-456/
+```
+
+Each PR gets isolated state—no conflicts!
+
+## How It Works
+
+1. **Checkout** - Checks out the PR branch via `gh pr checkout`
+2. **Fetch** - Retrieves unresolved review threads from GitHub
+3. **Diff** - Compares with previous run to identify new/changed threads
+4. **Invoke** - Runs agent with structured task list + repo context
+5. **Capture** - Saves agent's responses and file changes
+6. **Commit** - Optionally commits changes (with `--commit`)
+7. **Post** - Optionally posts responses to GitHub (with `post` command)
+
+**State tracking:** Only processes new/changed threads on subsequent runs, avoiding duplicate work.
+
+## Troubleshooting
+
+**"Missing dependency: 'elixir'"**
+```bash
+brew install elixir  # macOS
+```
+
+**"GitHub CLI not authenticated"**
+```bash
+gh auth login
+```
+
+**"Missing dependency: 'codex'" (and you want to use Claude)**
+```bash
+export AGENT_CMD=claude
+```
+
+**"Not in a git repository"**
+```bash
+cd /path/to/your/repo
+# or use: agent_reviews -C /path/to/your/repo run 123
+```
+
+**Slow startup?**
+```bash
+mix escript.build  # Creates faster standalone executable
+```
+
+## License
+
+[Add your license here]
