@@ -173,34 +173,6 @@ Each PR gets isolated state—no conflicts!
 
 **State tracking:** Only processes new/changed threads on subsequent runs, avoiding duplicate work.
 
-## Troubleshooting
-
-**"Missing dependency: 'elixir'"**
-```bash
-brew install elixir  # macOS
-```
-
-**"GitHub CLI not authenticated"**
-```bash
-gh auth login
-```
-
-**"Missing dependency: 'codex'" (and you want to use Claude)**
-```bash
-export AGENT_CMD=claude
-```
-
-**"Not in a git repository"**
-```bash
-cd /path/to/your/repo
-# or use: agent_reviews -C /path/to/your/repo run 123
-```
-
-**Slow startup?**
-```bash
-mix escript.build  # Creates faster standalone executable
-```
-
 ## License
 
-[Add your license here]
+MIT
