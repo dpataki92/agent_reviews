@@ -160,99 +160,103 @@ defmodule AgentReviews.CLI do
 
   defp run_in_root(root, pr_ref, opts) do
     with :ok <- ensure_clean_working_tree(root),
-         {:ok, checkout_ctx} <- checkout_pr_branch(root, pr_ref),
-         {:ok, fetch_ctx} <- run_fetch(root, pr_ref),
-         {:ok, tasks_doc} <- read_tasks_json(fetch_ctx.tasks_json) do
+         {:ok, checkout_ctx} <- checkout_pr_branch(root, pr_ref) do
       pr_number = Map.get(checkout_ctx, :pr_number)
       state_root = state_root(opts, root)
-      {:ok, prev_state} = load_pr_state(state_root, pr_number)
 
-      diff = diff_since_last_run(tasks_doc, prev_state)
-      selection = select_tasks_for_agent(tasks_doc, diff, prev_state)
+      with_pr_lock(state_root, pr_number, fn ->
+        with {:ok, fetch_ctx} <- run_fetch(root, pr_ref),
+             {:ok, tasks_doc} <- read_tasks_json(fetch_ctx.tasks_json) do
+          {:ok, prev_state} = load_pr_state(state_root, pr_number)
 
-      responses_md = Path.join([root, @agent_dir, "review_responses.md"])
+          diff = diff_since_last_run(tasks_doc, prev_state)
+          selection = select_tasks_for_agent(tasks_doc, diff, prev_state)
 
-      apply_ctx =
-        case selection.agent_tasks_doc do
-          nil ->
-            {:ok,
-             %{
-               tasks_json: fetch_ctx.tasks_json,
-               responses_md: responses_md,
-               agent_last_message: "",
-               agent_ran?: false,
-               changed_files: changed_files(root)
-             }}
+          responses_md = Path.join([root, @agent_dir, "review_responses.md"])
 
-          agent_tasks_doc ->
-            content = Jason.encode!(agent_tasks_doc, pretty: true) <> "\n"
+          apply_ctx =
+            case selection.agent_tasks_doc do
+              nil ->
+                {:ok,
+                 %{
+                   tasks_json: fetch_ctx.tasks_json,
+                   responses_md: responses_md,
+                   agent_last_message: "",
+                   agent_ran?: false,
+                   changed_files: changed_files(root)
+                 }}
 
-            with_temp_file("agent_reviews_tasks", ".json", content, fn agent_tasks_path ->
-              run_apply(root, fetch_ctx.tasks_json, agent_tasks_path, opts)
-            end)
+              agent_tasks_doc ->
+                content = Jason.encode!(agent_tasks_doc, pretty: true) <> "\n"
+
+                with_temp_file("agent_reviews_tasks", ".json", content, fn agent_tasks_path ->
+                  run_apply(root, fetch_ctx.tasks_json, agent_tasks_path, opts)
+                end)
+            end
+
+          with {:ok, apply_ctx} <- apply_ctx do
+            commit_ctx = maybe_commit(root, apply_ctx.tasks_json, opts)
+
+            case commit_ctx do
+              {:error, msg} ->
+                {:error, msg}
+
+              _ ->
+                {agent_body, agent_meta} =
+                  if apply_ctx.agent_ran? do
+                    split_agent_last_message(apply_ctx.agent_last_message)
+                  else
+                    {"", {:ok, %{"replies" => [], "top_level_comment" => ""}}}
+                  end
+
+                {carried_replies, carried_notes} =
+                  carried_forward_replies(tasks_doc, diff, prev_state)
+
+                final_meta =
+                  merge_posting_metadata(tasks_doc, carried_replies, agent_meta, carried_notes)
+
+                write_review_responses!(
+                  root,
+                  tasks_doc,
+                  apply_ctx.tasks_json,
+                  apply_ctx.responses_md,
+                  apply_ctx.agent_ran?,
+                  agent_body,
+                  apply_ctx.changed_files,
+                  commit_ctx,
+                  diff,
+                  prev_state,
+                  selection,
+                  carried_replies,
+                  carried_notes,
+                  agent_meta,
+                  final_meta
+                )
+
+                posting_metadata = detect_posting_metadata(root, apply_ctx.responses_md)
+
+                warn_state_write_error(
+                  update_pr_state_after_run(
+                    state_root,
+                    pr_number,
+                    tasks_doc,
+                    prev_state,
+                    agent_meta,
+                    selection,
+                    diff,
+                    final_meta,
+                    posting_metadata
+                  ),
+                  "Failed to persist run history"
+                )
+
+                apply_ctx = Map.put(apply_ctx, :posting_metadata, posting_metadata)
+                print_run_summary(root, fetch_ctx, apply_ctx, commit_ctx, opts)
+                :ok
+            end
+          end
         end
-
-      with {:ok, apply_ctx} <- apply_ctx do
-        commit_ctx = maybe_commit(root, apply_ctx.tasks_json, opts)
-
-        case commit_ctx do
-          {:error, msg} ->
-            {:error, msg}
-
-          _ ->
-            {agent_body, agent_meta} =
-              if apply_ctx.agent_ran? do
-                split_agent_last_message(apply_ctx.agent_last_message)
-              else
-                {"", {:ok, %{"replies" => [], "top_level_comment" => ""}}}
-              end
-
-            {carried_replies, carried_notes} =
-              carried_forward_replies(tasks_doc, diff, prev_state)
-
-            final_meta =
-              merge_posting_metadata(tasks_doc, carried_replies, agent_meta, carried_notes)
-
-            write_review_responses!(
-              root,
-              tasks_doc,
-              apply_ctx.tasks_json,
-              apply_ctx.responses_md,
-              apply_ctx.agent_ran?,
-              agent_body,
-              apply_ctx.changed_files,
-              commit_ctx,
-              diff,
-              prev_state,
-              selection,
-              carried_replies,
-              carried_notes,
-              agent_meta,
-              final_meta
-            )
-
-            posting_metadata = detect_posting_metadata(root, apply_ctx.responses_md)
-
-            warn_state_write_error(
-              update_pr_state_after_run(
-                state_root,
-                pr_number,
-                tasks_doc,
-                prev_state,
-                agent_meta,
-                selection,
-                diff,
-                final_meta,
-                posting_metadata
-              ),
-              "Failed to persist run history"
-            )
-
-            apply_ctx = Map.put(apply_ctx, :posting_metadata, posting_metadata)
-            print_run_summary(root, fetch_ctx, apply_ctx, commit_ctx, opts)
-            :ok
-        end
-      end
+      end)
     end
   end
 
@@ -692,6 +696,97 @@ defmodule AgentReviews.CLI do
     "'" <> String.replace(value, "'", "'\\''") <> "'"
   end
 
+  defp split_lines_trim_end(text) when is_binary(text) do
+    text
+    |> String.split(["\r\n", "\n", "\r"], trim: false)
+    |> Enum.reverse()
+    |> Enum.drop_while(fn l -> String.trim(l) == "" end)
+    |> Enum.reverse()
+  end
+
+  defp has_any_json_fence?(lines) when is_list(lines) do
+    Enum.any?(lines, fn line ->
+      line = to_string(line) |> String.trim()
+      Regex.match?(~r/^```(json|jsonc)\b/i, line)
+    end)
+  end
+
+  defp extract_final_json_fence_parts([]), do: {:error, :empty}
+
+  defp extract_final_json_fence_parts(lines) when is_list(lines) do
+    last_line = List.last(lines) |> to_string() |> String.trim()
+
+    if last_line != "```" do
+      {:error, :missing_close}
+    else
+      close_idx = length(lines) - 1
+
+      open_idx =
+        (close_idx - 1)..0//-1
+        |> Enum.find(fn i ->
+          line = Enum.at(lines, i) |> to_string() |> String.trim()
+          Regex.match?(~r/^```(json|jsonc)$/i, line)
+        end)
+
+      if is_integer(open_idx) do
+        before =
+          lines
+          |> Enum.take(open_idx)
+          |> Enum.join("\n")
+          |> String.trim_trailing()
+
+        json =
+          lines
+          |> Enum.slice(open_idx + 1, close_idx - open_idx - 1)
+          |> Enum.join("\n")
+          |> String.trim()
+
+        {:ok, %{before: before, json: json}}
+      else
+        {:error, :missing_open}
+      end
+    end
+  end
+
+  defp tail_excerpt(lines, n) when is_list(lines) and is_integer(n) and n > 0 do
+    lines
+    |> Enum.take(-n)
+    |> Enum.join("\n")
+    |> String.trim_trailing()
+  end
+
+  defp with_pr_lock(state_root, pr_number, fun)
+       when is_integer(pr_number) and is_function(fun, 0) do
+    lock_dir = Path.join([state_root, @agent_dir, "state", "locks"])
+    lock_path = Path.join(lock_dir, "pr-#{pr_number}.lock")
+
+    with :ok <- mkdir_p(lock_dir),
+         {:ok, io} <- File.open(lock_path, [:write, :exclusive]) do
+      now =
+        DateTime.utc_now()
+        |> DateTime.to_iso8601()
+
+      _ = IO.write(io, "pid=#{System.pid()} at=#{now}\n")
+
+      try do
+        fun.()
+      after
+        _ = File.close(io)
+        _ = File.rm(lock_path)
+      end
+    else
+      {:error, :eexist} ->
+        {:error,
+         "Another `agent_reviews` process appears to be running for PR #{pr_number}.\n\nLock: #{lock_path}\n\nIf you are sure nothing is running, delete the lock file and retry."}
+
+      {:error, msg} when is_binary(msg) ->
+        {:error, msg}
+
+      {:error, reason} ->
+        {:error, "Failed to acquire PR lock #{lock_path} (#{inspect(reason)})."}
+    end
+  end
+
   defp run_with_spinner(label, fun) when is_function(fun, 0) do
     if spinner_enabled?() do
       frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -935,91 +1030,93 @@ defmodule AgentReviews.CLI do
     with :ok <- ensure_gh_authed(),
          :ok <- ensure_cmd("gh"),
          {:ok, {_owner, _repo, pr_number}} <- parse_pr_ref(pr_ref, root) do
-      responses = Path.join([root, @agent_dir, "review_responses.md"])
-      tasks_json = Path.join([root, @agent_dir, "tasks.json"])
+      with_pr_lock(state_root(opts, root), pr_number, fn ->
+        responses = Path.join([root, @agent_dir, "review_responses.md"])
+        tasks_json = Path.join([root, @agent_dir, "tasks.json"])
 
-      cond do
-        not File.exists?(responses) ->
-          {:error, "Missing #{responses} (run: #{opts.invoke} <pr>)"}
+        cond do
+          not File.exists?(responses) ->
+            {:error, "Missing #{responses} (run: #{opts.invoke} <pr>)"}
 
-        not File.exists?(tasks_json) ->
-          {:error, "Missing #{tasks_json} (run: #{opts.invoke} <pr>)"}
+          not File.exists?(tasks_json) ->
+            {:error, "Missing #{tasks_json} (run: #{opts.invoke} <pr>)"}
 
-        File.read!(responses) |> String.trim() == "" ->
-          {:error, "#{responses} is empty"}
+          File.read!(responses) |> String.trim() == "" ->
+            {:error, "#{responses} is empty"}
 
-        true ->
-          content = File.read!(responses)
+          true ->
+            content = File.read!(responses)
 
-          case extract_posting_metadata(content, root) do
-            {:ok, %{"replies" => replies, "top_level_comment" => top_level_comment}} ->
-              with {:ok, task_map} <- parse_tasks_json_for_posting(tasks_json) do
-                replies_result = post_thread_replies(root, replies, task_map)
-                top_level_result = maybe_post_top_level_comment(root, pr_ref, top_level_comment)
+            case extract_posting_metadata(content, root) do
+              {:ok, %{"replies" => replies, "top_level_comment" => top_level_comment}} ->
+                with {:ok, task_map} <- parse_tasks_json_for_posting(tasks_json) do
+                  replies_result = post_thread_replies(root, replies, task_map)
+                  top_level_result = maybe_post_top_level_comment(root, pr_ref, top_level_comment)
 
-                case {replies_result, top_level_result} do
-                  {{:ok, posted, posted_thread_ids}, :ok} ->
-                    warn_state_write_error(
-                      mark_replies_posted(
-                        state_root(opts, root),
-                        pr_number,
-                        posted_thread_ids
-                      ),
-                      "Failed to persist posted-replies state"
-                    )
+                  case {replies_result, top_level_result} do
+                    {{:ok, posted, posted_thread_ids}, :ok} ->
+                      warn_state_write_error(
+                        mark_replies_posted(
+                          state_root(opts, root),
+                          pr_number,
+                          posted_thread_ids
+                        ),
+                        "Failed to persist posted-replies state"
+                      )
 
-                    {:ok,
-                     %{
-                       posted_replies: posted,
-                       top_level_posted?: String.trim(to_string(top_level_comment)) != ""
-                     }}
+                      {:ok,
+                       %{
+                         posted_replies: posted,
+                         top_level_posted?: String.trim(to_string(top_level_comment)) != ""
+                       }}
 
-                  {{:error, msg, posted_thread_ids}, :ok} ->
-                    warn_state_write_error(
-                      mark_replies_posted(
-                        state_root(opts, root),
-                        pr_number,
-                        posted_thread_ids
-                      ),
-                      "Failed to persist posted-replies state"
-                    )
+                    {{:error, msg, posted_thread_ids}, :ok} ->
+                      warn_state_write_error(
+                        mark_replies_posted(
+                          state_root(opts, root),
+                          pr_number,
+                          posted_thread_ids
+                        ),
+                        "Failed to persist posted-replies state"
+                      )
 
-                    {:error, msg}
+                      {:error, msg}
 
-                  {{:ok, posted, posted_thread_ids}, {:error, msg}} ->
-                    warn_state_write_error(
-                      mark_replies_posted(
-                        state_root(opts, root),
-                        pr_number,
-                        posted_thread_ids
-                      ),
-                      "Failed to persist posted-replies state"
-                    )
+                    {{:ok, posted, posted_thread_ids}, {:error, msg}} ->
+                      warn_state_write_error(
+                        mark_replies_posted(
+                          state_root(opts, root),
+                          pr_number,
+                          posted_thread_ids
+                        ),
+                        "Failed to persist posted-replies state"
+                      )
 
-                    {:error,
-                     "Posted #{posted} thread replies, but failed to post top-level comment.\n\n#{msg}"}
+                      {:error,
+                       "Posted #{posted} thread replies, but failed to post top-level comment.\n\n#{msg}"}
 
-                  {{:error, msg1, posted_thread_ids}, {:error, msg2}} ->
-                    warn_state_write_error(
-                      mark_replies_posted(
-                        state_root(opts, root),
-                        pr_number,
-                        posted_thread_ids
-                      ),
-                      "Failed to persist posted-replies state"
-                    )
+                    {{:error, msg1, posted_thread_ids}, {:error, msg2}} ->
+                      warn_state_write_error(
+                        mark_replies_posted(
+                          state_root(opts, root),
+                          pr_number,
+                          posted_thread_ids
+                        ),
+                        "Failed to persist posted-replies state"
+                      )
 
-                    {:error, msg1 <> "\n\n" <> msg2}
+                      {:error, msg1 <> "\n\n" <> msg2}
+                  end
+                else
+                  {:error, _} ->
+                    {:error, "Failed to parse #{tasks_json} for posting validation."}
                 end
-              else
-                {:error, _} ->
-                  {:error, "Failed to parse #{tasks_json} for posting validation."}
-              end
 
-            {:error, reason} ->
-              {:error, reason}
-          end
-      end
+              {:error, reason} ->
+                {:error, reason}
+            end
+        end
+      end)
     else
       {:error, msg} -> {:error, msg}
     end
@@ -1602,54 +1699,48 @@ defmodule AgentReviews.CLI do
 
   defp split_agent_last_message(message) when is_binary(message) do
     message = to_string(message)
+    lines = split_lines_trim_end(message)
+    has_any_json_fence? = has_any_json_fence?(lines)
 
-    lines =
-      message
-      |> String.split(["\r\n", "\n", "\r"], trim: false)
-      |> Enum.reverse()
-      |> Enum.drop_while(fn l -> String.trim(l) == "" end)
-      |> Enum.reverse()
+    case extract_final_json_fence_parts(lines) do
+      {:ok, %{before: before, json: json}} ->
+        case parse_posting_metadata_json(json) do
+          {:ok, decoded} ->
+            {before, {:ok, decoded}}
 
-    case lines do
-      [] ->
-        {message, {:error, "Missing final posting metadata JSON block."}}
-
-      _ ->
-        last_line = List.last(lines) |> to_string() |> String.trim()
-
-        if last_line != "```" do
-          {message, {:error, "Missing final posting metadata JSON block."}}
-        else
-          close_idx = length(lines) - 1
-
-          open_idx =
-            (close_idx - 1)..0//-1
-            |> Enum.find(fn i ->
-              line = Enum.at(lines, i) |> to_string() |> String.trim()
-              Regex.match?(~r/^```(json|jsonc)$/i, line)
-            end)
-
-          if is_integer(open_idx) do
-            body =
-              lines
-              |> Enum.take(open_idx)
-              |> Enum.join("\n")
-              |> String.trim_trailing()
-
-            json =
-              lines
-              |> Enum.slice(open_idx + 1, close_idx - open_idx - 1)
-              |> Enum.join("\n")
-              |> String.trim()
-
-            case parse_posting_metadata_json(json) do
-              {:ok, decoded} -> {body, {:ok, decoded}}
-              {:error, reason} -> {message, {:error, reason}}
-            end
-          else
-            {message, {:error, "Missing final posting metadata JSON block."}}
-          end
+          {:error, reason} ->
+            {message, {:error, reason}}
         end
+
+      {:error, kind} ->
+        tail = tail_excerpt(lines, 18)
+
+        msg =
+          case {kind, has_any_json_fence?} do
+            {:empty, _} ->
+              "Missing final posting metadata JSON block."
+
+            {:missing_close, true} ->
+              "Found a ```json block, but it is missing the closing ``` fence at the very end of the message."
+
+            {:missing_close, false} ->
+              "Missing final posting metadata JSON block."
+
+            {:missing_open, true} ->
+              "Found a closing ``` fence at the end, but could not find a matching ```json opener."
+
+            {:missing_open, false} ->
+              "Missing final posting metadata JSON block."
+          end
+
+        extra =
+          if tail == "" do
+            ""
+          else
+            "\n\nLast lines seen:\n\n```\n#{tail}\n```"
+          end
+
+        {message, {:error, msg <> extra}}
     end
   end
 
@@ -2332,58 +2423,29 @@ defmodule AgentReviews.CLI do
   end
 
   defp extract_final_json_fence(content) when is_binary(content) do
-    lines =
-      content
-      |> String.split(["\r\n", "\n", "\r"], trim: false)
-      |> Enum.reverse()
-      |> Enum.drop_while(fn l -> String.trim(l) == "" end)
-      |> Enum.reverse()
+    lines = split_lines_trim_end(content)
+    has_any_json_fence? = has_any_json_fence?(lines)
 
-    has_any_json_fence? =
-      Enum.any?(lines, fn line ->
-        line = to_string(line) |> String.trim()
-        Regex.match?(~r/^```(json|jsonc)\b/i, line)
-      end)
+    case extract_final_json_fence_parts(lines) do
+      {:ok, %{json: json}} ->
+        {:ok, json}
 
-    case lines do
-      [] ->
+      {:error, :empty} ->
         {:error,
          "Could not find a JSON posting metadata code block (```json ... ```) in `#{@agent_dir}/review_responses.md`."}
 
-      _ ->
-        last_line = List.last(lines) |> to_string() |> String.trim()
-
-        if last_line != "```" do
-          if has_any_json_fence? do
-            {:error,
-             "Found a JSON code block, but posting metadata must be the FINAL fenced ```json block at the end of `#{@agent_dir}/review_responses.md`."}
-          else
-            {:error,
-             "Could not find a JSON posting metadata code block (```json ... ```) in `#{@agent_dir}/review_responses.md`."}
-          end
+      {:error, :missing_close} ->
+        if has_any_json_fence? do
+          {:error,
+           "Found a JSON code block, but posting metadata must be the FINAL fenced ```json block at the end of `#{@agent_dir}/review_responses.md`."}
         else
-          close_idx = length(lines) - 1
-
-          open_idx =
-            (close_idx - 1)..0//-1
-            |> Enum.find(fn i ->
-              line = Enum.at(lines, i) |> to_string() |> String.trim()
-              Regex.match?(~r/^```(json|jsonc)$/i, line)
-            end)
-
-          if is_integer(open_idx) do
-            body =
-              lines
-              |> Enum.slice(open_idx + 1, close_idx - open_idx - 1)
-              |> Enum.join("\n")
-              |> String.trim()
-
-            {:ok, body}
-          else
-            {:error,
-             "Found a JSON code block, but posting metadata must be the FINAL fenced ```json block at the end of `#{@agent_dir}/review_responses.md`."}
-          end
+          {:error,
+           "Could not find a JSON posting metadata code block (```json ... ```) in `#{@agent_dir}/review_responses.md`."}
         end
+
+      {:error, :missing_open} ->
+        {:error,
+         "Found a JSON code block, but posting metadata must be the FINAL fenced ```json block at the end of `#{@agent_dir}/review_responses.md`."}
     end
   end
 
