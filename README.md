@@ -7,7 +7,7 @@ Automate GitHub PR review responses using AI agents (Codex CLI or Claude Code). 
 ```bash
 # 1. Clone this repo
 git clone <repo-url>
-cd agent-reviews
+cd agent_reviews
 
 # 2. Install dependencies
 mix deps.get
