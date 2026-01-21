@@ -3,6 +3,8 @@ defmodule AgentReviews.Guidelines do
   @max_depth 5
 
   def load(root, common_root) do
+    home_guidelines = Path.join(System.user_home!(), ".agent_reviews_guidelines.md")
+
     candidates =
       [root, common_root]
       |> Enum.map(fn
@@ -11,6 +13,7 @@ defmodule AgentReviews.Guidelines do
       end)
       |> Enum.reject(&is_nil/1)
       |> Enum.uniq()
+      |> then(&(&1 ++ [home_guidelines]))
 
     Enum.find_value(candidates, {nil, nil, []}, fn path ->
       if File.exists?(path) and File.regular?(path) do
