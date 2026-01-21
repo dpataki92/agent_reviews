@@ -36,7 +36,8 @@ defmodule AgentReviews.CLI do
         repo: nil,
         commit?: false,
         worktree?: false,
-        worktree_dir: nil
+        worktree_dir: nil,
+        additional_comment: nil
       },
       []
     )
@@ -64,6 +65,12 @@ defmodule AgentReviews.CLI do
 
   defp parse_opts(["--commit" | rest], opts, rest_rev),
     do: parse_opts(rest, %{opts | commit?: true}, rest_rev)
+
+  defp parse_opts(["--comment", comment | rest], opts, rest_rev),
+    do: parse_opts(rest, %{opts | additional_comment: comment}, rest_rev)
+
+  defp parse_opts(["-m", comment | rest], opts, rest_rev),
+    do: parse_opts(rest, %{opts | additional_comment: comment}, rest_rev)
 
   defp parse_opts([other | rest], opts, rest_rev),
     do: parse_opts(rest, opts, [other | rest_rev])
@@ -291,6 +298,7 @@ defmodule AgentReviews.CLI do
       --model MODEL           Set the Codex model (same as `codex --model`).
       --reasoning-effort LVL  Set `reasoning_effort` via `codex --config` (e.g. low|medium|high).
       --commit                After a successful run, create a local git commit (never pushes).
+      -m, --comment TEXT      Add additional context/instructions for this specific run only.
 
       --worktree              (run only) Run inside a per-PR git worktree under `.worktrees/` (enables parallel PR sessions).
       --worktree-dir DIR      Override worktree base dir (default: `<repo_root>/.worktrees/agent_reviews`).
@@ -2144,11 +2152,25 @@ defmodule AgentReviews.CLI do
     guidance_section =
       build_guidance_section(guidelines_path, guidelines_md, always_read_path, always_read)
 
+    additional_context =
+      case Map.get(opts, :additional_comment) do
+        comment when is_binary(comment) and comment != "" ->
+          """
+
+          ## Additional Context for This Review
+
+          #{comment}
+          """
+
+        _ ->
+          ""
+      end
+
     """
     # PR Review Implementation Task
 
     Read `#{tasks_ref}` and implement/respond to each task systematically.
-
+    #{additional_context}
     #{guidance_section}
 
     ## Decision Framework
