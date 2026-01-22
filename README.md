@@ -50,8 +50,14 @@ agent_reviews run 123
 # Auto-commit changes
 agent_reviews run 123 --commit
 
-# Post responses to GitHub
+# Add extra instructions for this run only
+agent_reviews run 123 -m "Focus on performance, ignore style issues"
+
+# Post responses to GitHub (parses Task Responses from review_responses.md)
 agent_reviews post 123
+
+# Clean up for a fresh run (wipes tasks.json, review_responses.md, and state)
+agent_reviews clean
 ```
 
 ### PR Reference Formats
@@ -120,6 +126,7 @@ After running, check `.agent_review/` in your target repo:
 
 ```bash
 --commit                  # Auto-commit changes made by agent
+-m, --comment TEXT        # Add extra instructions for this run only
 --worktree                # Use git worktree for parallel PR work
 --model MODEL             # Override model (e.g., --model gpt-4)
 --reasoning-effort LEVEL  # Set reasoning effort (low/medium/high)
@@ -128,17 +135,26 @@ After running, check `.agent_review/` in your target repo:
 
 ## Advanced Features
 
-### Repo-Specific Guidance
+### Custom Guidelines
 
-Create these files in your target repo to guide the agent:
+Guide the agent with custom instructions at two levels:
 
-**`.agent_reviews_guidelines.md`** - Custom instructions for the agent:
+**User-level** (`~/.agent_reviews_guidelines.md`) - Applied to all repos:
+```markdown
+# My Preferences
+- Always explain your reasoning
+- Prefer simple solutions over clever ones
+```
+
+**Repo-level** (`.agent_reviews_guidelines.md`) - Project-specific instructions:
 ```markdown
 # Project Guidelines
 - Always run tests after changes
 - Follow error handling patterns in src/errors.rs
 @include docs/style-guide.md
 ```
+
+Both files support `@include path/to/file.md` to pull in additional content.
 
 **`.agent_reviews_always_read.txt`** - Files the agent should read first:
 ```
@@ -167,11 +183,14 @@ Each PR gets isolated state—no conflicts!
 2. **Fetch** - Retrieves unresolved review threads from GitHub
 3. **Diff** - Compares with previous run to identify new/changed threads
 4. **Invoke** - Runs agent with structured task list + repo context
-5. **Capture** - Saves agent's responses and file changes
-6. **Commit** - Optionally commits changes (with `--commit`)
-7. **Post** - Optionally posts responses to GitHub (with `post` command)
+5. **Capture** - Saves agent's responses to `review_responses.md`
+6. **Review** - You review and edit the Task Responses section as needed
+7. **Commit** - Optionally commits file changes (with `--commit`)
+8. **Post** - Parses Task Responses from MD and posts to GitHub (with `post` command)
 
 **State tracking:** Only processes new/changed threads on subsequent runs, avoiding duplicate work.
+
+**Fresh start:** Use `agent_reviews clean` to wipe all state and start over (useful when switching agents or re-running from scratch).
 
 ## License
 
