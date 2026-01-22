@@ -1062,12 +1062,8 @@ defmodule AgentReviews.CLI do
 
             with {:ok, task_map} <- parse_tasks_json_for_posting(tasks_json),
                  {:ok, replies} <- extract_replies_from_md(content, task_map) do
-              replies_result = post_thread_replies(root, replies, task_map)
-              # No top-level comment in new flow
-              top_level_result = :ok
-
-              case {replies_result, top_level_result} do
-                {{:ok, posted, posted_thread_ids}, :ok} ->
+              case post_thread_replies(root, replies, task_map) do
+                {:ok, posted, posted_thread_ids} ->
                   warn_state_write_error(
                     mark_replies_posted(
                       state_root(opts, root),
@@ -1083,7 +1079,7 @@ defmodule AgentReviews.CLI do
                      top_level_posted?: false
                    }}
 
-                {{:error, msg, posted_thread_ids}, :ok} ->
+                {:error, msg, posted_thread_ids} ->
                   warn_state_write_error(
                     mark_replies_posted(
                       state_root(opts, root),
@@ -1094,31 +1090,6 @@ defmodule AgentReviews.CLI do
                   )
 
                   {:error, msg}
-
-                {{:ok, posted, posted_thread_ids}, {:error, msg}} ->
-                  warn_state_write_error(
-                    mark_replies_posted(
-                      state_root(opts, root),
-                      pr_number,
-                      posted_thread_ids
-                    ),
-                    "Failed to persist posted-replies state"
-                  )
-
-                  {:error,
-                   "Posted #{posted} thread replies, but failed to post top-level comment.\n\n#{msg}"}
-
-                {{:error, msg1, posted_thread_ids}, {:error, msg2}} ->
-                  warn_state_write_error(
-                    mark_replies_posted(
-                      state_root(opts, root),
-                      pr_number,
-                      posted_thread_ids
-                    ),
-                    "Failed to persist posted-replies state"
-                  )
-
-                  {:error, msg1 <> "\n\n" <> msg2}
               end
             else
               {:error, reason} ->
@@ -2469,47 +2440,6 @@ defmodule AgentReviews.CLI do
 
   defp parse_pr_ref(ref, root), do: AgentReviews.Repo.parse_pr_ref(ref, root)
 
-  # Posting metadata parsing (stdlib-only JSON parser)
-  defp extract_posting_metadata(content, _root) do
-    with {:ok, block} <- extract_final_json_fence(content),
-         {:ok, decoded} <- parse_posting_metadata_json(block) do
-      {:ok, decoded}
-    else
-      {:error, msg} -> {:error, msg}
-    end
-  rescue
-    _ ->
-      {:error,
-       "Failed to parse JSON posting metadata block. Ensure the final fenced ```json block is valid JSON."}
-  end
-
-  defp extract_final_json_fence(content) when is_binary(content) do
-    lines = split_lines_trim_end(content)
-    has_any_json_fence? = has_any_json_fence?(lines)
-
-    case extract_final_json_fence_parts(lines) do
-      {:ok, %{json: json}} ->
-        {:ok, json}
-
-      {:error, :empty} ->
-        {:error,
-         "Could not find a JSON posting metadata code block (```json ... ```) in `#{@agent_dir}/review_responses.md`."}
-
-      {:error, :missing_close} ->
-        if has_any_json_fence? do
-          {:error,
-           "Found a JSON code block, but posting metadata must be the FINAL fenced ```json block at the end of `#{@agent_dir}/review_responses.md`."}
-        else
-          {:error,
-           "Could not find a JSON posting metadata code block (```json ... ```) in `#{@agent_dir}/review_responses.md`."}
-        end
-
-      {:error, :missing_open} ->
-        {:error,
-         "Found a JSON code block, but posting metadata must be the FINAL fenced ```json block at the end of `#{@agent_dir}/review_responses.md`."}
-    end
-  end
-
   defp parse_posting_metadata_json(json) when is_binary(json) do
     case Jason.decode(json) do
       {:ok, %{"replies" => replies} = decoded} when is_list(replies) ->
@@ -2634,6 +2564,7 @@ defmodule AgentReviews.CLI do
     end
   end
 
+  @doc false
   # Extracts replies from the agent's "### Task Responses" section in review_responses.md
   # Format expected:
   #   #### Task N: `path` (`type`)
@@ -2642,12 +2573,13 @@ defmodule AgentReviews.CLI do
   #   **Reply:**
   #   The reply body...
   #   ---
-  defp extract_replies_from_md(content, task_map) when is_binary(content) and is_map(task_map) do
-    # Parse each #### Task block
-    # Match: #### Task N: ... **Decision:** X ... **Reply:** ... (until --- or next #### Task or ## or end)
+  def extract_replies_from_md(content, task_map) when is_binary(content) and is_map(task_map) do
+    # Parse each #### Task block that has a **Reply:** section
+    # The regex uses negative lookahead (?!---|####) to avoid crossing task boundaries
+    # before finding **Reply:**
     reply_blocks =
       Regex.scan(
-        ~r/####\s+Task\s+(\d+):[^\n]*\n.*?\*\*Decision:\*\*\s*(\w+).*?\*\*Reply:\*\*\s*\n(.*?)(?=\n---|\n####\s+Task\s+\d+:|\n##\s|\z)/s,
+        ~r/####\s+Task\s+(\d+):[^\n]*\n(?:(?!---|####\s+Task).)*?\*\*Decision:\*\*\s*(\w+)(?:(?!---|####\s+Task).)*?\*\*Reply:\*\*\s*\n(.*?)(?=\n---|\n####\s+Task\s+\d+:|\n##\s|\z)/s,
         content
       )
 
@@ -2696,7 +2628,7 @@ defmodule AgentReviews.CLI do
          carried_replies,
          carried_notes,
          agent_meta,
-         final_meta
+         _final_meta
        ) do
     tasks_rel = Path.relative_to(tasks_json_path, root)
 
@@ -3150,25 +3082,6 @@ defmodule AgentReviews.CLI do
       end
     end)
   end
-
-  defp maybe_post_top_level_comment(root, pr_ref, top_level_comment)
-       when is_binary(top_level_comment) do
-    if String.trim(top_level_comment) == "" do
-      :ok
-    else
-      with_temp_file("agent_reviews_top_level_comment", ".md", top_level_comment, fn path ->
-        case System.cmd("gh", ["pr", "comment", pr_ref, "--body-file", path],
-               cd: root,
-               stderr_to_stdout: true
-             ) do
-          {_out, 0} -> :ok
-          {out, _} -> {:error, "Failed to post top-level PR comment.\n\nOutput:\n#{out}"}
-        end
-      end)
-    end
-  end
-
-  defp maybe_post_top_level_comment(_root, _pr_ref, _), do: :ok
 
   defp with_temp_file(prefix, suffix, content, fun) when is_function(fun, 1) do
     path = tmp_path(prefix, suffix)
