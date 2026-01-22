@@ -37,7 +37,8 @@ defmodule AgentReviews.CLI do
         commit?: false,
         worktree?: false,
         worktree_dir: nil,
-        additional_comment: nil
+        additional_comment: nil,
+        dry_run?: false
       },
       []
     )
@@ -65,6 +66,9 @@ defmodule AgentReviews.CLI do
 
   defp parse_opts(["--commit" | rest], opts, rest_rev),
     do: parse_opts(rest, %{opts | commit?: true}, rest_rev)
+
+  defp parse_opts(["--dry-run" | rest], opts, rest_rev),
+    do: parse_opts(rest, %{opts | dry_run?: true}, rest_rev)
 
   defp parse_opts(["--comment", comment | rest], opts, rest_rev),
     do: parse_opts(rest, %{opts | additional_comment: comment}, rest_rev)
@@ -871,14 +875,22 @@ defmodule AgentReviews.CLI do
   defp print_post_summary(root, pr_ref, post_ctx, opts) do
     invoke = invoke_for_root(opts.invoke, root)
 
-    IO.puts("\n== #{opts.invoke} post ==")
-    IO.puts("Repo: #{Path.expand(root)}")
-    IO.puts("PR: #{pr_ref}")
-    IO.puts("Effective: #{effective_config_summary(opts, nil)}")
-    IO.puts("Thread replies posted: #{post_ctx.posted_replies}")
-    IO.puts("Top-level comment posted: #{if(post_ctx.top_level_posted?, do: "yes", else: "no")}")
-    IO.puts("Next: `#{invoke} run <pr-number|pr-url>` (optional)")
-    IO.puts("Status: ✅ success")
+    if Map.get(post_ctx, :dry_run) do
+      IO.puts("Status: ✅ dry run complete (nothing posted)")
+    else
+      IO.puts("\n== #{opts.invoke} post ==")
+      IO.puts("Repo: #{Path.expand(root)}")
+      IO.puts("PR: #{pr_ref}")
+      IO.puts("Effective: #{effective_config_summary(opts, nil)}")
+      IO.puts("Thread replies posted: #{post_ctx.posted_replies}")
+
+      IO.puts(
+        "Top-level comment posted: #{if(post_ctx.top_level_posted?, do: "yes", else: "no")}"
+      )
+
+      IO.puts("Next: `#{invoke} run <pr-number|pr-url>` (optional)")
+      IO.puts("Status: ✅ success")
+    end
   end
 
   defp display_output_path(path, root) do
@@ -1062,34 +1074,39 @@ defmodule AgentReviews.CLI do
 
             with {:ok, task_map} <- parse_tasks_json_for_posting(tasks_json),
                  {:ok, replies} <- extract_replies_from_md(content, task_map) do
-              case post_thread_replies(root, replies, task_map) do
-                {:ok, posted, posted_thread_ids} ->
-                  warn_state_write_error(
-                    mark_replies_posted(
-                      state_root(opts, root),
-                      pr_number,
-                      posted_thread_ids
-                    ),
-                    "Failed to persist posted-replies state"
-                  )
+              if Map.get(opts, :dry_run?, false) do
+                print_dry_run_replies(replies)
+                {:ok, %{posted_replies: 0, top_level_posted?: false, dry_run: true}}
+              else
+                case post_thread_replies(root, replies, task_map) do
+                  {:ok, posted, posted_thread_ids} ->
+                    warn_state_write_error(
+                      mark_replies_posted(
+                        state_root(opts, root),
+                        pr_number,
+                        posted_thread_ids
+                      ),
+                      "Failed to persist posted-replies state"
+                    )
 
-                  {:ok,
-                   %{
-                     posted_replies: posted,
-                     top_level_posted?: false
-                   }}
+                    {:ok,
+                     %{
+                       posted_replies: posted,
+                       top_level_posted?: false
+                     }}
 
-                {:error, msg, posted_thread_ids} ->
-                  warn_state_write_error(
-                    mark_replies_posted(
-                      state_root(opts, root),
-                      pr_number,
-                      posted_thread_ids
-                    ),
-                    "Failed to persist posted-replies state"
-                  )
+                  {:error, msg, posted_thread_ids} ->
+                    warn_state_write_error(
+                      mark_replies_posted(
+                        state_root(opts, root),
+                        pr_number,
+                        posted_thread_ids
+                      ),
+                      "Failed to persist posted-replies state"
+                    )
 
-                  {:error, msg}
+                    {:error, msg}
+                end
               end
             else
               {:error, reason} ->
@@ -2457,6 +2474,29 @@ defmodule AgentReviews.CLI do
         {:error,
          "Failed to parse posting metadata JSON (#{Exception.message(reason)}). Ensure the final fenced ```json block is valid JSON."}
     end
+  end
+
+  defp print_dry_run_replies(replies) do
+    IO.puts("\n== DRY RUN: Would post #{length(replies)} replies ==\n")
+
+    if replies == [] do
+      IO.puts("(no replies to post)")
+    else
+      Enum.each(replies, fn reply ->
+        task_id = Map.get(reply, "task_id", "?")
+        thread_id = Map.get(reply, "thread_id", "?")
+        decision = Map.get(reply, "decision", "?")
+        body = Map.get(reply, "body", "") |> String.trim()
+
+        IO.puts("--- Task #{task_id} (#{decision}) ---")
+        IO.puts("Thread: #{thread_id}")
+        IO.puts("")
+        IO.puts(body)
+        IO.puts("")
+      end)
+    end
+
+    IO.puts("== END DRY RUN ==\n")
   end
 
   defp post_thread_replies(root, replies, task_map) do
