@@ -105,6 +105,9 @@ defmodule AgentReviews.CLI do
           end
         end
 
+      ["clean"] ->
+        run_clean(root)
+
       [pr_ref] ->
         run_with_worktree_if_enabled(root, pr_ref, opts)
 
@@ -292,6 +295,7 @@ defmodule AgentReviews.CLI do
       #{invoke} [-C PATH|--repo PATH] [global opts] <pr-number|pr-url|owner/repo#number>
       #{invoke} [-C PATH|--repo PATH] [global opts] run <pr-number|pr-url|owner/repo#number>
       #{invoke} [-C PATH|--repo PATH] [global opts] post <pr-number|pr-url>
+      #{invoke} [-C PATH|--repo PATH] clean
 
     Global opts:
       -C, --repo PATH         Target git repo (defaults to current directory).
@@ -313,7 +317,8 @@ defmodule AgentReviews.CLI do
 
     Notes:
       - `run` fetches review threads, runs the agent, and writes outputs under `#{@agent_dir}/` in the target repo.
-      - `post` is optional and posts per-thread replies when the required JSON metadata block is present.
+      - `post` parses the Task Responses section from review_responses.md and posts replies to GitHub.
+      - `clean` deletes tasks.json, review_responses.md, and state files to allow a fresh run.
     """)
   end
 
@@ -1055,71 +1060,67 @@ defmodule AgentReviews.CLI do
           true ->
             content = File.read!(responses)
 
-            case extract_posting_metadata(content, root) do
-              {:ok, %{"replies" => replies, "top_level_comment" => top_level_comment}} ->
-                with {:ok, task_map} <- parse_tasks_json_for_posting(tasks_json) do
-                  replies_result = post_thread_replies(root, replies, task_map)
-                  top_level_result = maybe_post_top_level_comment(root, pr_ref, top_level_comment)
+            with {:ok, task_map} <- parse_tasks_json_for_posting(tasks_json),
+                 {:ok, replies} <- extract_replies_from_md(content, task_map) do
+              replies_result = post_thread_replies(root, replies, task_map)
+              # No top-level comment in new flow
+              top_level_result = :ok
 
-                  case {replies_result, top_level_result} do
-                    {{:ok, posted, posted_thread_ids}, :ok} ->
-                      warn_state_write_error(
-                        mark_replies_posted(
-                          state_root(opts, root),
-                          pr_number,
-                          posted_thread_ids
-                        ),
-                        "Failed to persist posted-replies state"
-                      )
+              case {replies_result, top_level_result} do
+                {{:ok, posted, posted_thread_ids}, :ok} ->
+                  warn_state_write_error(
+                    mark_replies_posted(
+                      state_root(opts, root),
+                      pr_number,
+                      posted_thread_ids
+                    ),
+                    "Failed to persist posted-replies state"
+                  )
 
-                      {:ok,
-                       %{
-                         posted_replies: posted,
-                         top_level_posted?: String.trim(to_string(top_level_comment)) != ""
-                       }}
+                  {:ok,
+                   %{
+                     posted_replies: posted,
+                     top_level_posted?: false
+                   }}
 
-                    {{:error, msg, posted_thread_ids}, :ok} ->
-                      warn_state_write_error(
-                        mark_replies_posted(
-                          state_root(opts, root),
-                          pr_number,
-                          posted_thread_ids
-                        ),
-                        "Failed to persist posted-replies state"
-                      )
+                {{:error, msg, posted_thread_ids}, :ok} ->
+                  warn_state_write_error(
+                    mark_replies_posted(
+                      state_root(opts, root),
+                      pr_number,
+                      posted_thread_ids
+                    ),
+                    "Failed to persist posted-replies state"
+                  )
 
-                      {:error, msg}
+                  {:error, msg}
 
-                    {{:ok, posted, posted_thread_ids}, {:error, msg}} ->
-                      warn_state_write_error(
-                        mark_replies_posted(
-                          state_root(opts, root),
-                          pr_number,
-                          posted_thread_ids
-                        ),
-                        "Failed to persist posted-replies state"
-                      )
+                {{:ok, posted, posted_thread_ids}, {:error, msg}} ->
+                  warn_state_write_error(
+                    mark_replies_posted(
+                      state_root(opts, root),
+                      pr_number,
+                      posted_thread_ids
+                    ),
+                    "Failed to persist posted-replies state"
+                  )
 
-                      {:error,
-                       "Posted #{posted} thread replies, but failed to post top-level comment.\n\n#{msg}"}
+                  {:error,
+                   "Posted #{posted} thread replies, but failed to post top-level comment.\n\n#{msg}"}
 
-                    {{:error, msg1, posted_thread_ids}, {:error, msg2}} ->
-                      warn_state_write_error(
-                        mark_replies_posted(
-                          state_root(opts, root),
-                          pr_number,
-                          posted_thread_ids
-                        ),
-                        "Failed to persist posted-replies state"
-                      )
+                {{:error, msg1, posted_thread_ids}, {:error, msg2}} ->
+                  warn_state_write_error(
+                    mark_replies_posted(
+                      state_root(opts, root),
+                      pr_number,
+                      posted_thread_ids
+                    ),
+                    "Failed to persist posted-replies state"
+                  )
 
-                      {:error, msg1 <> "\n\n" <> msg2}
-                  end
-                else
-                  {:error, _} ->
-                    {:error, "Failed to parse #{tasks_json} for posting validation."}
-                end
-
+                  {:error, msg1 <> "\n\n" <> msg2}
+              end
+            else
               {:error, reason} ->
                 {:error, reason}
             end
@@ -1128,6 +1129,46 @@ defmodule AgentReviews.CLI do
     else
       {:error, msg} -> {:error, msg}
     end
+  end
+
+  defp run_clean(root) do
+    tasks_json = Path.join([root, @agent_dir, "tasks.json"])
+    responses_md = Path.join([root, @agent_dir, "review_responses.md"])
+    state_dir = Path.join([root, @agent_dir, "state"])
+
+    # Delete individual files
+    deleted_files =
+      [tasks_json, responses_md]
+      |> Enum.filter(&File.exists?/1)
+      |> Enum.map(fn path ->
+        File.rm!(path)
+        path
+      end)
+
+    # Delete all state files
+    deleted_state =
+      if File.dir?(state_dir) do
+        state_dir
+        |> File.ls!()
+        |> Enum.map(fn file -> Path.join(state_dir, file) end)
+        |> Enum.filter(&File.regular?/1)
+        |> Enum.map(fn path ->
+          File.rm!(path)
+          path
+        end)
+      else
+        []
+      end
+
+    deleted = deleted_files ++ deleted_state
+
+    if deleted == [] do
+      IO.puts("Nothing to clean.")
+    else
+      Enum.each(deleted, fn path -> IO.puts("Deleted: #{path}") end)
+    end
+
+    :ok
   end
 
   defp gh_graphql_pages(owner, repo, number) do
@@ -2340,28 +2381,26 @@ defmodule AgentReviews.CLI do
     end
   end
 
-  defp detect_posting_metadata(root, responses_md) do
+  defp detect_posting_metadata(_root, responses_md) do
     case File.read(responses_md) do
       {:ok, content} ->
-        case extract_posting_metadata(content, root) do
-          {:ok, %{"replies" => replies, "top_level_comment" => top_level_comment}} ->
-            %{
-              status: :ok,
-              replies: length(replies),
-              top_level?: String.trim(to_string(top_level_comment)) != ""
-            }
+        # Count Task Response blocks in the MD (#### Task N: ... **Decision:** ... **Reply:**)
+        reply_blocks =
+          Regex.scan(
+            ~r/####\s+Task\s+\d+:[^\n]*\n.*?\*\*Decision:\*\*\s*\w+.*?\*\*Reply:\*\*/s,
+            content
+          )
 
-          {:error, reason} ->
-            reason = to_string(reason)
+        reply_count = length(reply_blocks)
 
-            if String.contains?(reason, "Could not find a JSON posting metadata") do
-              %{status: :missing}
-            else
-              %{
-                status: :invalid,
-                reason: reason
-              }
-            end
+        if reply_count > 0 do
+          %{
+            status: :ok,
+            replies: reply_count,
+            top_level?: false
+          }
+        else
+          %{status: :missing}
         end
 
       _ ->
@@ -2595,6 +2634,53 @@ defmodule AgentReviews.CLI do
     end
   end
 
+  # Extracts replies from the agent's "### Task Responses" section in review_responses.md
+  # Format expected:
+  #   #### Task N: `path` (`type`)
+  #   **Ask (excerpt):** "..."
+  #   **Decision:** ANSWER|PUSHBACK
+  #   **Reply:**
+  #   The reply body...
+  #   ---
+  defp extract_replies_from_md(content, task_map) when is_binary(content) and is_map(task_map) do
+    # Parse each #### Task block
+    # Match: #### Task N: ... **Decision:** X ... **Reply:** ... (until --- or next #### Task or ## or end)
+    reply_blocks =
+      Regex.scan(
+        ~r/####\s+Task\s+(\d+):[^\n]*\n.*?\*\*Decision:\*\*\s*(\w+).*?\*\*Reply:\*\*\s*\n(.*?)(?=\n---|\n####\s+Task\s+\d+:|\n##\s|\z)/s,
+        content
+      )
+
+    replies =
+      reply_blocks
+      |> Enum.flat_map(fn [_, task_id_str, decision, body] ->
+        task_id = String.to_integer(task_id_str)
+
+        case Map.get(task_map, task_id) do
+          nil ->
+            # No thread_id found for this task, skip it
+            []
+
+          thread_id ->
+            [
+              %{
+                "task_id" => task_id,
+                "thread_id" => thread_id,
+                "decision" => String.upcase(String.trim(decision)),
+                "body" => String.trim(body)
+              }
+            ]
+        end
+      end)
+
+    if replies == [] and reply_blocks != [] do
+      {:error,
+       "Found #{length(reply_blocks)} task responses but could not match any to tasks.json"}
+    else
+      {:ok, replies}
+    end
+  end
+
   defp write_review_responses!(
          root,
          tasks_doc,
@@ -2613,7 +2699,6 @@ defmodule AgentReviews.CLI do
          final_meta
        ) do
     tasks_rel = Path.relative_to(tasks_json_path, root)
-    tasks_list = tasks_list_for_wrapper(tasks_json_path)
 
     pr_title = Map.get(tasks_doc, "pr_title", "") |> to_string()
     pr_url = Map.get(tasks_doc, "pr_url", "") |> to_string()
@@ -2651,8 +2736,6 @@ defmodule AgentReviews.CLI do
           |> Kernel.<>("\n")
       end
 
-    meta_json = Jason.encode!(final_meta, pretty: true) <> "\n"
-
     doc =
       [
         "# PR Review Responses\n",
@@ -2670,9 +2753,6 @@ defmodule AgentReviews.CLI do
         "\n",
         "\n",
         since_last,
-        "## Task List\n",
-        tasks_list,
-        "\n",
         "## Working Tree\n",
         changed,
         "\n",
@@ -2682,13 +2762,7 @@ defmodule AgentReviews.CLI do
         "## Agent Output (Last Message)\n",
         "\n",
         agent_meta_note,
-        agent_output,
-        "\n",
-        "## Posting Metadata (final)\n",
-        "\n",
-        "```json\n",
-        meta_json,
-        "```\n"
+        agent_output
       ]
       |> IO.iodata_to_binary()
 
