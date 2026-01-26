@@ -1,4 +1,6 @@
 defmodule AgentReviews.Repo do
+  @moduledoc false
+
   @agent_dir ".agent_review"
 
   def git_root(nil), do: git_root(".")

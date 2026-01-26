@@ -1,4 +1,6 @@
 defmodule AgentReviews.Runtime do
+  @moduledoc false
+
   def invoke_name do
     System.get_env("AGENT_REVIEWS_INVOKE") || "agent_reviews"
   end

@@ -1,4 +1,6 @@
 defmodule AgentReviews.Config do
+  @moduledoc false
+
   def load_effective_opts(root, opts) do
     defaults = %{
       model: nil,

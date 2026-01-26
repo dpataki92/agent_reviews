@@ -212,7 +212,7 @@ defmodule AgentReviews.ExtractRepliesTest do
       assert reply["decision"] == "ANSWER"
     end
 
-    test "stops at next ## section" do
+    test "does not truncate at ## headings inside a reply" do
       content = """
       #### Task 1: `lib/foo.ex:42` (`change`)
       **Ask (excerpt):** "Test"
@@ -221,14 +221,83 @@ defmodule AgentReviews.ExtractRepliesTest do
       **Reply:**
       Reply text that should be captured.
 
-      ## Next Section
+      ## A heading inside the reply
 
-      This should not be captured.
+      This should still be captured.
       """
 
       assert {:ok, [reply]} = CLI.extract_replies_from_md(content, @task_map)
-      assert reply["body"] == "Reply text that should be captured."
-      refute reply["body"] =~ "Next Section"
+      assert reply["body"] =~ "Reply text that should be captured."
+      assert reply["body"] =~ "## A heading inside the reply"
+      assert reply["body"] =~ "This should still be captured."
+    end
+
+    test "does not truncate at --- horizontal rules inside a reply" do
+      content = """
+      #### Task 1: `lib/foo.ex:42` (`change`)
+      **Ask (excerpt):** "Test"
+      **Decision:** ANSWER
+
+      **Reply:**
+      First paragraph.
+
+      ---
+
+      Second paragraph after horizontal rule.
+
+      ---
+      """
+
+      assert {:ok, [reply]} = CLI.extract_replies_from_md(content, @task_map)
+      assert reply["body"] =~ "First paragraph."
+      assert reply["body"] =~ "Second paragraph after horizontal rule."
+    end
+
+    test "does not include Posting Metadata section in the last reply when missing separator" do
+      content = """
+      #### Task 1: `lib/foo.ex:42` (`change`)
+      **Ask (excerpt):** "Test"
+      **Decision:** ANSWER
+
+      **Reply:**
+      Reply text.
+
+      ## Posting Metadata (auto-generated)
+
+      ```json
+      {"replies":[],"top_level_comment":""}
+      ```
+      """
+
+      assert {:ok, [reply]} = CLI.extract_replies_from_md(content, @task_map)
+      assert reply["body"] =~ "Reply text."
+      refute reply["body"] =~ "Posting Metadata"
+      refute reply["body"] =~ "```json"
+    end
+
+    test "ignores Task headings inside code fences" do
+      content = """
+      ### Task Responses
+
+      ```markdown
+      #### Task 999: `lib/bad.ex:1` (`change`)
+      **Decision:** ANSWER
+      **Reply:**
+      should never be parsed
+      ```
+
+      #### Task 1: `lib/foo.ex:42` (`change`)
+      **Ask (excerpt):** "Test"
+      **Decision:** ANSWER
+
+      **Reply:**
+      Real reply.
+      ---
+      """
+
+      assert {:ok, [reply]} = CLI.extract_replies_from_md(content, @task_map)
+      assert reply["task_id"] == 1
+      assert reply["body"] =~ "Real reply."
     end
 
     test "handles task without trailing ---" do

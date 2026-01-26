@@ -1,4 +1,6 @@
 defmodule AgentReviews.Tasks do
+  @moduledoc false
+
   def tasks_yaml(pr_title, pr_url, head_ref, base_ref, head_sha, base_sha, tasks) do
     header = [
       "pr_title: ",

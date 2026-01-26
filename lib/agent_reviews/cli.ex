@@ -1,4 +1,6 @@
 defmodule AgentReviews.CLI do
+  @moduledoc false
+
   @agent_dir ".agent_review"
   @agent_timeout_ms 2 * 60 * 60 * 1000
 
@@ -110,7 +112,7 @@ defmodule AgentReviews.CLI do
         end
 
       ["clean"] ->
-        run_clean(root)
+        run_clean(root, opts)
 
       [pr_ref] ->
         run_with_worktree_if_enabled(root, pr_ref, opts)
@@ -460,14 +462,8 @@ defmodule AgentReviews.CLI do
               acc
             else
               entry = Map.get(acc, tid, %{})
-              decision = Map.get(entry, "decision", "") |> to_string() |> String.trim()
-              body = Map.get(entry, "reply_body", "") |> to_string() |> String.trim()
-
-              if decision in ["ANSWER", "PUSHBACK"] and body != "" do
-                Map.put(acc, tid, Map.put(entry, "reply_posted_at", now))
-              else
-                acc
-              end
+              entry = Map.put(entry, "reply_posted_at", now)
+              Map.put(acc, tid, entry)
             end
           end)
 
@@ -885,6 +881,10 @@ defmodule AgentReviews.CLI do
       IO.puts("Thread replies posted: #{post_ctx.posted_replies}")
 
       IO.puts(
+        "Thread replies skipped (already posted): #{Map.get(post_ctx, :skipped_replies, 0)}"
+      )
+
+      IO.puts(
         "Top-level comment posted: #{if(post_ctx.top_level_posted?, do: "yes", else: "no")}"
       )
 
@@ -1054,7 +1054,7 @@ defmodule AgentReviews.CLI do
   defp run_post(root, pr_ref, opts) do
     with :ok <- ensure_gh_authed(),
          :ok <- ensure_cmd("gh"),
-         {:ok, {_owner, _repo, pr_number}} <- parse_pr_ref(pr_ref, root) do
+         {:ok, {owner, repo, pr_number}} <- parse_pr_ref(pr_ref, root) do
       with_pr_lock(state_root(opts, root), pr_number, fn ->
         responses = Path.join([root, @agent_dir, "review_responses.md"])
         tasks_json = Path.join([root, @agent_dir, "tasks.json"])
@@ -1072,11 +1072,64 @@ defmodule AgentReviews.CLI do
           true ->
             content = File.read!(responses)
 
-            with {:ok, task_map} <- parse_tasks_json_for_posting(tasks_json),
+            with {:ok, tasks_doc} <- read_tasks_json(tasks_json),
+                 :ok <- validate_tasks_doc_matches_pr_ref(tasks_doc, owner, repo, pr_number),
+                 {:ok, task_map} <- parse_tasks_json_for_posting(tasks_json),
                  {:ok, replies} <- extract_replies_from_md(content, task_map) do
+              # Auto-sync posting metadata JSON at the end of the MD file from Task Responses.
+              # The human-readable Task Responses remain the source of truth; the JSON block is generated.
+              posting_meta_existing = parse_posting_metadata_from_review_responses(content)
+              top_level_comment = top_level_comment_from_posting_meta(posting_meta_existing)
+
+              posting_meta =
+                build_posting_metadata_from_task_replies(
+                  replies,
+                  top_level_comment
+                )
+
+              replies = Map.get(posting_meta, "replies", [])
+
+              _updated_content =
+                case upsert_final_posting_metadata_json_block(content, posting_meta) do
+                  {:ok, updated} ->
+                    if updated != content do
+                      File.write!(responses, updated)
+                      IO.puts("Updated: #{responses} (posting metadata JSON)")
+                    end
+
+                    updated
+
+                  {:error, msg} ->
+                    IO.puts(:stderr, "WARN: Could not auto-sync posting metadata JSON: #{msg}")
+                    content
+                end
+
+              {replies, skipped} =
+                filter_posted_replies(state_root(opts, root), pr_number, replies)
+
+              if skipped > 0 do
+                IO.puts(
+                  :stderr,
+                  "WARN: Skipping #{skipped} replies that appear already posted (to repost, delete .agent_review/state/pr-#{pr_number}.json or run `#{opts.invoke} clean`)."
+                )
+              end
+
               if Map.get(opts, :dry_run?, false) do
                 print_dry_run_replies(replies)
-                {:ok, %{posted_replies: 0, top_level_posted?: false, dry_run: true}}
+
+                if String.trim(top_level_comment) != "" do
+                  IO.puts("\n== DRY RUN: Would post top-level PR comment ==\n")
+                  IO.puts(top_level_comment |> String.trim())
+                  IO.puts("\n== END DRY RUN ==\n")
+                end
+
+                {:ok,
+                 %{
+                   posted_replies: 0,
+                   skipped_replies: skipped,
+                   top_level_posted?: false,
+                   dry_run: true
+                 }}
               else
                 case post_thread_replies(root, replies, task_map) do
                   {:ok, posted, posted_thread_ids} ->
@@ -1089,10 +1142,20 @@ defmodule AgentReviews.CLI do
                       "Failed to persist posted-replies state"
                     )
 
+                    top_level_posted? =
+                      maybe_post_top_level_comment(
+                        root,
+                        state_root(opts, root),
+                        pr_number,
+                        pr_ref,
+                        top_level_comment
+                      )
+
                     {:ok,
                      %{
                        posted_replies: posted,
-                       top_level_posted?: false
+                       skipped_replies: skipped,
+                       top_level_posted?: top_level_posted?
                      }}
 
                   {:error, msg, posted_thread_ids} ->
@@ -1119,10 +1182,250 @@ defmodule AgentReviews.CLI do
     end
   end
 
-  defp run_clean(root) do
+  defp parse_posting_metadata_from_review_responses(content) when is_binary(content) do
+    lines = split_lines_trim_end(content)
+    has_any_json_fence? = has_any_json_fence?(lines)
+
+    case extract_final_json_fence_parts(lines) do
+      {:ok, %{json: json}} ->
+        case parse_posting_metadata_json(json) do
+          {:ok, decoded} ->
+            {:ok, decoded}
+
+          {:error, reason} ->
+            {:error, "#{reason}\n\nNote: could not parse final ```json posting metadata block."}
+        end
+
+      {:error, _kind} ->
+        if has_any_json_fence? do
+          {:error,
+           "Found a ```json block but could not parse a final posting-metadata JSON block."}
+        else
+          {:ok, %{"replies" => [], "top_level_comment" => ""}}
+        end
+    end
+  end
+
+  defp top_level_comment_from_posting_meta({:ok, %{"top_level_comment" => tlc}})
+       when is_binary(tlc),
+       do: tlc
+
+  defp top_level_comment_from_posting_meta(_), do: ""
+
+  defp maybe_post_top_level_comment(_root, _state_root, _pr_number, _pr_ref, body)
+       when not is_binary(body),
+       do: false
+
+  defp maybe_post_top_level_comment(_root, _state_root, _pr_number, _pr_ref, body)
+       when is_binary(body) and body == "",
+       do: false
+
+  defp maybe_post_top_level_comment(root, state_root, pr_number, pr_ref, body)
+       when is_binary(body) and is_integer(pr_number) do
+    body = String.trim(body)
+
+    cond do
+      body == "" ->
+        false
+
+      top_level_already_posted?(state_root, pr_number, body) ->
+        false
+
+      true ->
+        case post_pr_top_level_comment(root, pr_ref, body) do
+          :ok ->
+            warn_state_write_error(
+              mark_top_level_posted(state_root, pr_number, body),
+              "Failed to persist top-level-comment posted state"
+            )
+
+            true
+
+          {:error, msg} ->
+            IO.puts(:stderr, "WARN: Failed to post top-level PR comment: #{msg}")
+            false
+        end
+    end
+  end
+
+  defp post_pr_top_level_comment(root, pr_ref, body) when is_binary(pr_ref) and is_binary(body) do
+    with_temp_file("agent_reviews_top_level_comment", ".md", body, fn body_path ->
+      case System.cmd("gh", ["pr", "comment", pr_ref, "--body-file", body_path],
+             cd: root,
+             stderr_to_stdout: true
+           ) do
+        {_out, 0} -> :ok
+        {out, _} -> {:error, out}
+      end
+    end)
+  end
+
+  defp top_level_already_posted?(state_root, pr_number, body)
+       when is_integer(pr_number) and is_binary(body) do
+    {:ok, state} = load_pr_state(state_root, pr_number)
+    sha = sha256_hex(body)
+
+    posted_sha =
+      state
+      |> map_get_map("top_level_comment")
+      |> Map.get("body_sha", nil)
+      |> to_string()
+      |> String.trim()
+
+    posted_at =
+      state
+      |> map_get_map("top_level_comment")
+      |> Map.get("posted_at", nil)
+      |> to_string()
+      |> String.trim()
+
+    posted_sha != "" and posted_at != "" and posted_sha == sha
+  end
+
+  defp mark_top_level_posted(state_root, pr_number, body)
+       when is_integer(pr_number) and is_binary(body) do
+    now =
+      DateTime.utc_now()
+      |> DateTime.to_iso8601()
+
+    sha = sha256_hex(body)
+
+    {:ok, state} = load_pr_state(state_root, pr_number)
+    state = state || %{}
+
+    state =
+      Map.put(state, "top_level_comment", %{
+        "posted_at" => now,
+        "body_sha" => sha
+      })
+
+    write_pr_state(state_root, pr_number, state)
+  end
+
+  defp sha256_hex(body) when is_binary(body) do
+    :crypto.hash(:sha256, body)
+    |> Base.encode16(case: :lower)
+  end
+
+  defp build_posting_metadata_from_task_replies(replies, top_level_comment)
+       when is_list(replies) and is_binary(top_level_comment) do
+    replies_json =
+      replies
+      |> Enum.map(fn r ->
+        %{
+          "task_id" => Map.get(r, "task_id"),
+          "thread_id" => Map.get(r, "thread_id"),
+          "decision" => Map.get(r, "decision"),
+          "body" => Map.get(r, "body")
+        }
+      end)
+
+    %{
+      "replies" => replies_json,
+      "top_level_comment" => top_level_comment
+    }
+  end
+
+  defp upsert_final_posting_metadata_json_block(content, posting_meta)
+       when is_binary(content) and is_map(posting_meta) do
+    json = Jason.encode!(posting_meta, pretty: true)
+    lines = split_lines_trim_end(content)
+
+    case extract_final_json_fence_parts(lines) do
+      {:ok, %{before: before}} ->
+        updated =
+          [
+            String.trim_trailing(before),
+            "\n\n```json\n",
+            String.trim_trailing(json),
+            "\n```\n"
+          ]
+          |> IO.iodata_to_binary()
+
+        {:ok, updated}
+
+      {:error, _} ->
+        updated =
+          [
+            String.trim_trailing(content),
+            "\n\n## Posting Metadata (auto-generated)\n\n```json\n",
+            String.trim_trailing(json),
+            "\n```\n"
+          ]
+          |> IO.iodata_to_binary()
+
+        {:ok, updated}
+    end
+  rescue
+    e ->
+      {:error, Exception.message(e)}
+  end
+
+  defp filter_posted_replies(state_root, pr_number, replies)
+       when is_integer(pr_number) and is_list(replies) do
+    {:ok, prev_state} = load_pr_state(state_root, pr_number)
+    threads = map_get_map(prev_state, "threads")
+
+    {keep, skipped} =
+      Enum.reduce(replies, {[], 0}, fn reply, {acc, skipped} ->
+        tid = Map.get(reply, "thread_id", "") |> to_string() |> String.trim()
+
+        posted_at =
+          threads
+          |> Map.get(tid, %{})
+          |> Map.get("reply_posted_at", nil)
+          |> to_string()
+          |> String.trim()
+
+        if tid != "" and posted_at != "" do
+          {acc, skipped + 1}
+        else
+          {[reply | acc], skipped}
+        end
+      end)
+
+    {Enum.reverse(keep), skipped}
+  end
+
+  defp validate_tasks_doc_matches_pr_ref(tasks_doc, owner, repo, pr_number)
+       when is_map(tasks_doc) and is_binary(owner) and is_binary(repo) and is_integer(pr_number) do
+    pr_url = Map.get(tasks_doc, "pr_url", "") |> to_string() |> String.trim()
+
+    case Regex.run(~r/github\.com\/([^\/]+)\/([^\/]+)\/pull\/(\d+)/i, pr_url) do
+      [_, url_owner, url_repo, url_num] ->
+        num =
+          case Integer.parse(url_num) do
+            {n, _} -> n
+            _ -> nil
+          end
+
+        cond do
+          not is_integer(num) ->
+            {:error, "Invalid pr_url in #{@agent_dir}/tasks.json: #{inspect(pr_url)}"}
+
+          String.downcase(url_owner) != String.downcase(owner) or
+            String.downcase(url_repo) != String.downcase(repo) or
+              num != pr_number ->
+            {:error,
+             "#{@agent_dir}/tasks.json does not match the PR you are trying to post to.\n\n" <>
+               "Given PR ref: #{owner}/#{repo}##{pr_number}\n" <>
+               "tasks.json pr_url: #{pr_url}\n\n" <>
+               "This usually means you have stale #{@agent_dir}/tasks.json from another PR. Re-run: #{invoke_name()} run #{owner}/#{repo}##{pr_number}"}
+
+          true ->
+            :ok
+        end
+
+      _ ->
+        {:error,
+         "Could not verify PR identity from #{@agent_dir}/tasks.json pr_url=#{inspect(pr_url)}. Refusing to post."}
+    end
+  end
+
+  defp run_clean(root, opts) do
     tasks_json = Path.join([root, @agent_dir, "tasks.json"])
     responses_md = Path.join([root, @agent_dir, "review_responses.md"])
-    state_dir = Path.join([root, @agent_dir, "state"])
+    state_dir = Path.join([state_root(opts, root), @agent_dir, "state"])
 
     # Delete individual files
     deleted_files =
@@ -1133,17 +1436,13 @@ defmodule AgentReviews.CLI do
         path
       end)
 
-    # Delete all state files
+    # Delete all state (including nested locks/)
     deleted_state =
       if File.dir?(state_dir) do
-        state_dir
-        |> File.ls!()
-        |> Enum.map(fn file -> Path.join(state_dir, file) end)
-        |> Enum.filter(&File.regular?/1)
-        |> Enum.map(fn path ->
-          File.rm!(path)
-          path
-        end)
+        case File.rm_rf(state_dir) do
+          {:ok, _} -> [state_dir]
+          {:error, _path, _reason} -> []
+        end
       else
         []
       end
@@ -1966,6 +2265,12 @@ defmodule AgentReviews.CLI do
     threads =
       update_decisions_for_agent_tasks(threads, selection, agent_meta, final_meta, now)
 
+    # Preserve top-level comment posted state across runs.
+    top_level_comment_state =
+      prev_state
+      |> map_get_map("top_level_comment")
+      |> then(fn m -> if(m == %{}, do: nil, else: m) end)
+
     state =
       %{
         "version" => 1,
@@ -1976,6 +2281,13 @@ defmodule AgentReviews.CLI do
         "last_open_thread_ids" => current_thread_ids,
         "threads" => threads
       }
+      |> then(fn s ->
+        if is_map(top_level_comment_state) do
+          Map.put(s, "top_level_comment", top_level_comment_state)
+        else
+          s
+        end
+      end)
 
     write_pr_state(state_root, pr_number, state)
   end
@@ -2219,7 +2531,7 @@ defmodule AgentReviews.CLI do
     - NO commits or pushes
     ## Output Requirements (important)
 
-    - You MUST list **all** tasks from `#{tasks_ref}` in order (Task 1..N).
+    - You MUST list **all** tasks from `#{tasks_ref}` in order, using each task's `id` as the task number (do NOT renumber to 1..N).
     - For each task, include a short excerpt of the original ask so a developer can understand the request without opening GitHub.
     - For **ACCEPT** decisions: be concise (what changed + which files).
     - For **ANSWER** and **PUSHBACK** decisions: be more verbose with reasoning, and include small examples/snippets when helpful. The response should be copy-paste ready for GitHub.
@@ -2232,7 +2544,7 @@ defmodule AgentReviews.CLI do
     ### Task Responses
     For each task, use this structure:
 
-    #### Task 1: `path:line` (`type`)
+    #### Task <id>: `path:line` (`type`)
     **Ask (excerpt):** "..."
     **Decision:** ACCEPT | ANSWER | PUSHBACK
     - For ACCEPT: bullets describing the exact changes and filenames.
@@ -2372,20 +2684,30 @@ defmodule AgentReviews.CLI do
   defp detect_posting_metadata(_root, responses_md) do
     case File.read(responses_md) do
       {:ok, content} ->
-        # Count Task Response blocks in the MD (#### Task N: ... **Decision:** ... **Reply:**)
-        reply_blocks =
-          Regex.scan(
-            ~r/####\s+Task\s+\d+:[^\n]*\n.*?\*\*Decision:\*\*\s*\w+.*?\*\*Reply:\*\*/s,
-            content
+        {:ok, task_responses} = parse_task_responses_from_md(content)
+
+        reply_count =
+          task_responses
+          |> Enum.count(fn r ->
+            decision =
+              Map.get(r, :decision, "") |> to_string() |> String.trim() |> String.upcase()
+
+            body = Map.get(r, :reply, "") |> to_string() |> String.trim()
+            decision in ["ANSWER", "PUSHBACK"] and body != ""
+          end)
+
+        top_level_comment =
+          top_level_comment_from_posting_meta(
+            parse_posting_metadata_from_review_responses(content)
           )
 
-        reply_count = length(reply_blocks)
+        top_level? = String.trim(top_level_comment) != ""
 
-        if reply_count > 0 do
+        if reply_count > 0 or top_level? do
           %{
             status: :ok,
             replies: reply_count,
-            top_level?: false
+            top_level?: top_level?
           }
         else
           %{status: :missing}
@@ -2614,42 +2936,325 @@ defmodule AgentReviews.CLI do
   #   The reply body...
   #   ---
   def extract_replies_from_md(content, task_map) when is_binary(content) and is_map(task_map) do
-    # Parse each #### Task block that has a **Reply:** section
-    # The regex uses negative lookahead (?!---|####) to avoid crossing task boundaries
-    # before finding **Reply:**
-    reply_blocks =
-      Regex.scan(
-        ~r/####\s+Task\s+(\d+):[^\n]*\n(?:(?!---|####\s+Task).)*?\*\*Decision:\*\*\s*(\w+)(?:(?!---|####\s+Task).)*?\*\*Reply:\*\*\s*\n(.*?)(?=\n---|\n####\s+Task\s+\d+:|\n##\s|\z)/s,
-        content
-      )
+    with {:ok, task_responses} <- parse_task_responses_from_md(content) do
+      reply_candidates =
+        task_responses
+        |> Enum.filter(fn r ->
+          decision = Map.get(r, :decision, "") |> to_string() |> String.trim() |> String.upcase()
+          body = Map.get(r, :reply, "") |> to_string() |> String.trim()
+          decision in ["ANSWER", "PUSHBACK"] and body != ""
+        end)
 
-    replies =
-      reply_blocks
-      |> Enum.flat_map(fn [_, task_id_str, decision, body] ->
-        task_id = String.to_integer(task_id_str)
+      replies =
+        task_responses
+        |> Enum.flat_map(fn r ->
+          task_id = Map.get(r, :task_id, nil)
+          decision = Map.get(r, :decision, "") |> to_string() |> String.trim() |> String.upcase()
+          body = Map.get(r, :reply, "") |> to_string() |> String.trim()
 
-        case Map.get(task_map, task_id) do
-          nil ->
-            # No thread_id found for this task, skip it
-            []
+          cond do
+            not is_integer(task_id) ->
+              []
 
-          thread_id ->
-            [
-              %{
-                "task_id" => task_id,
-                "thread_id" => thread_id,
-                "decision" => String.upcase(String.trim(decision)),
-                "body" => String.trim(body)
-              }
-            ]
+            decision not in ["ANSWER", "PUSHBACK"] ->
+              []
+
+            body == "" ->
+              []
+
+            Map.get(task_map, task_id) == nil ->
+              []
+
+            true ->
+              [
+                %{
+                  "task_id" => task_id,
+                  "thread_id" => Map.get(task_map, task_id),
+                  "decision" => decision,
+                  "body" => body
+                }
+              ]
+          end
+        end)
+
+      if replies == [] and reply_candidates != [] do
+        # We saw Reply blocks, but none mapped to tasks.json.
+        {:error,
+         "Found #{length(reply_candidates)} task responses but could not match any to #{@agent_dir}/tasks.json"}
+      else
+        {:ok, replies}
+      end
+    end
+  end
+
+  defp parse_task_responses_from_md(content) when is_binary(content) do
+    lines = String.split(content, ["\r\n", "\n", "\r"], trim: false)
+    lines = task_responses_section_lines(lines) || lines
+    {:ok, parse_task_responses_from_lines(lines)}
+  end
+
+  defp parse_task_responses_from_lines(lines) when is_list(lines) do
+    {blocks_rev, current, _fence} =
+      Enum.reduce(lines, {[], nil, nil}, fn line, {acc, cur, fence} ->
+        {fence, fence_line?} = fence_step(fence, line)
+        in_fence? = is_map(fence)
+
+        cond do
+          fence_line? ->
+            # Never treat fence delimiters as headings; just append to current block if present.
+            if is_map(cur) do
+              {acc, %{cur | lines_rev: [line | cur.lines_rev]}, fence}
+            else
+              {acc, cur, fence}
+            end
+
+          in_fence? ->
+            # Inside a code fence: do not detect headings/decision/reply markers.
+            if is_map(cur) do
+              {acc, %{cur | lines_rev: [line | cur.lines_rev]}, fence}
+            else
+              {acc, cur, fence}
+            end
+
+          true ->
+            case parse_task_heading(line) do
+              {:ok, task_id} ->
+                acc =
+                  if is_map(cur) do
+                    [%{task_id: cur.task_id, lines: Enum.reverse(cur.lines_rev)} | acc]
+                  else
+                    acc
+                  end
+
+                {acc, %{task_id: task_id, lines_rev: []}, fence}
+
+              :no ->
+                if is_map(cur) do
+                  {acc, %{cur | lines_rev: [line | cur.lines_rev]}, fence}
+                else
+                  {acc, cur, fence}
+                end
+            end
         end
       end)
 
-    if replies == [] and reply_blocks != [] do
-      {:error,
-       "Found #{length(reply_blocks)} task responses but could not match any to tasks.json"}
+    blocks_rev =
+      if is_map(current) do
+        [%{task_id: current.task_id, lines: Enum.reverse(current.lines_rev)} | blocks_rev]
+      else
+        blocks_rev
+      end
+
+    blocks = Enum.reverse(blocks_rev)
+
+    Enum.map(blocks, fn %{task_id: task_id, lines: block_lines} ->
+      decision = parse_task_decision(block_lines)
+      reply = parse_task_reply(block_lines)
+      %{task_id: task_id, decision: decision, reply: reply}
+    end)
+  end
+
+  defp parse_task_decision(block_lines) when is_list(block_lines) do
+    {_fence, decision} =
+      Enum.reduce(block_lines, {nil, ""}, fn line, {fence, decision} ->
+        {fence, fence_line?} = fence_step(fence, line)
+        in_fence? = is_map(fence)
+
+        cond do
+          decision != "" ->
+            {fence, decision}
+
+          fence_line? or in_fence? ->
+            {fence, decision}
+
+          true ->
+            case Regex.run(~r/\*\*Decision:\*\*\s*([A-Za-z]+)/, line) do
+              [_, d] -> {fence, d |> to_string() |> String.trim() |> String.upcase()}
+              _ -> {fence, decision}
+            end
+        end
+      end)
+
+    decision
+  end
+
+  defp task_responses_section_lines(lines) when is_list(lines) do
+    task_responses_re = ~r/^###\s+Task Responses\b/i
+    posting_meta_re = ~r/^##\s+Posting Metadata\b/i
+
+    {mode, _fence, acc_rev} =
+      Enum.reduce(lines, {:search, nil, []}, fn line, {mode, fence, acc} ->
+        {fence, fence_line?} = fence_step(fence, line)
+        in_fence? = is_map(fence)
+
+        cond do
+          mode == :done ->
+            {:done, fence, acc}
+
+          in_fence? or fence_line? ->
+            if mode == :collect, do: {:collect, fence, [line | acc]}, else: {mode, fence, acc}
+
+          mode == :search and Regex.match?(task_responses_re, String.trim(line)) ->
+            {:collect, fence, acc}
+
+          mode == :collect and Regex.match?(posting_meta_re, String.trim(line)) ->
+            {:done, fence, acc}
+
+          mode == :collect ->
+            {:collect, fence, [line | acc]}
+
+          true ->
+            {mode, fence, acc}
+        end
+      end)
+
+    collected = Enum.reverse(acc_rev)
+
+    if mode == :search and collected == [] do
+      nil
     else
-      {:ok, replies}
+      collected
+    end
+  end
+
+  # Track fenced code blocks so we don't parse Task headings inside them.
+  # We support backtick (```) and tilde (~~~) fences. We only track char + minimum length.
+  defp fence_step(fence, line) when is_binary(line) do
+    trimmed = String.trim_leading(line)
+
+    {char, count} =
+      case String.first(trimmed) do
+        "`" -> {"`", count_leading(trimmed, "`")}
+        "~" -> {"~", count_leading(trimmed, "~")}
+        _ -> {nil, 0}
+      end
+
+    if char != nil and count >= 3 do
+      if is_map(fence) do
+        if Map.get(fence, :char) == char and count >= Map.get(fence, :min, 3) do
+          {nil, true}
+        else
+          {fence, false}
+        end
+      else
+        {%{char: char, min: count}, true}
+      end
+    else
+      {fence, false}
+    end
+  end
+
+  defp count_leading(text, ch) when is_binary(text) and is_binary(ch) do
+    text
+    |> String.graphemes()
+    |> Enum.take_while(&(&1 == ch))
+    |> length()
+  end
+
+  defp parse_task_heading(line) when is_binary(line) do
+    case Regex.run(~r/^\#{3,4}\s+Task\s+(\d+)\s*:/, line) do
+      [_, id_str] ->
+        case Integer.parse(id_str) do
+          {id, _} -> {:ok, id}
+          _ -> :no
+        end
+
+      _ ->
+        :no
+    end
+  end
+
+  defp parse_task_reply(lines) when is_list(lines) do
+    {idx, _fence} =
+      Enum.reduce_while(Enum.with_index(lines), {nil, nil}, fn {line, idx}, {_found, fence} ->
+        {fence, fence_line?} = fence_step(fence, line)
+        in_fence? = is_map(fence)
+
+        cond do
+          fence_line? or in_fence? ->
+            {:cont, {nil, fence}}
+
+          String.contains?(line, "**Reply:**") ->
+            {:halt, {idx, fence}}
+
+          true ->
+            {:cont, {nil, fence}}
+        end
+      end)
+
+    if is_integer(idx) do
+      {_, rest} = Enum.split(lines, idx)
+      reply_line = Enum.at(rest, 0) || ""
+
+      inline =
+        case String.split(reply_line, "**Reply:**", parts: 2) do
+          [_] -> ""
+          [_, after_text] -> after_text
+        end
+
+      reply_lines =
+        ([String.trim_leading(inline)] ++ Enum.drop(rest, 1))
+        |> Enum.drop_while(fn l -> String.trim(l) == "" end)
+
+      reply_lines
+      |> take_reply_lines_until_boundary()
+      |> Enum.join("\n")
+      |> String.trim()
+    else
+      ""
+    end
+  end
+
+  defp take_reply_lines_until_boundary(lines) when is_list(lines) do
+    task_heading_re = ~r/^\#{3,4}\s+Task\s+\d+\s*:/
+
+    {kept_rev, _stop?, _fence} =
+      Enum.reduce_while(Enum.with_index(lines), {[], false, nil}, fn {line, idx},
+                                                                     {acc, _, fence} ->
+        {fence, fence_line?} = fence_step(fence, line)
+        in_fence? = is_map(fence)
+        trimmed = String.trim(line)
+
+        cond do
+          fence_line? or in_fence? ->
+            {:cont, {[line | acc], false, fence}}
+
+          Regex.match?(~r/^##\s+Posting Metadata\b/, trimmed) ->
+            {:halt, {acc, true, fence}}
+
+          Regex.match?(task_heading_re, trimmed) ->
+            {:halt, {acc, true, fence}}
+
+          trimmed == "---" and reply_boundary_after?(lines, idx, task_heading_re) ->
+            {:halt, {acc, true, fence}}
+
+          true ->
+            {:cont, {[line | acc], false, fence}}
+        end
+      end)
+
+    Enum.reverse(kept_rev)
+  end
+
+  defp reply_boundary_after?(lines, idx, task_heading_re)
+       when is_list(lines) and is_integer(idx) do
+    next =
+      lines
+      |> Enum.drop(idx + 1)
+      |> Enum.find(fn l -> String.trim(l) != "" end)
+
+    cond do
+      next == nil ->
+        true
+
+      Regex.match?(task_heading_re, next) ->
+        true
+
+      Regex.match?(~r/^##\s+Posting Metadata\b/, next) ->
+        true
+
+      true ->
+        false
     end
   end
 

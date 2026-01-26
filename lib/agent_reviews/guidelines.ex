@@ -1,26 +1,56 @@
 defmodule AgentReviews.Guidelines do
+  @moduledoc false
+
   @max_chars 24_000
   @max_depth 5
 
   def load(root, common_root) do
     home_guidelines = Path.join(System.user_home!(), ".agent_reviews_guidelines.md")
 
-    candidates =
-      [root, common_root]
+    repo_candidates =
+      [common_root, root]
       |> Enum.map(fn
         nil -> nil
         p -> Path.join(p, ".agent_reviews_guidelines.md")
       end)
       |> Enum.reject(&is_nil/1)
       |> Enum.uniq()
-      |> then(&(&1 ++ [home_guidelines]))
+      |> Enum.filter(fn path -> File.exists?(path) and File.regular?(path) end)
 
-    Enum.find_value(candidates, {nil, nil, []}, fn path ->
-      if File.exists?(path) and File.regular?(path) do
-        {content, warnings} = read_with_includes(path)
-        {path, content, warnings}
-      end
-    end)
+    user_candidates =
+      [home_guidelines]
+      |> Enum.filter(fn path -> File.exists?(path) and File.regular?(path) end)
+
+    candidates = user_candidates ++ repo_candidates
+
+    if candidates == [] do
+      {nil, nil, []}
+    else
+      {sections_rev, warnings_rev} =
+        Enum.reduce(candidates, {[], []}, fn path, {sections, warns} ->
+          {content, warnings} = read_with_includes(path)
+
+          section =
+            [
+              "### Guidelines from `",
+              path,
+              "`\n\n",
+              content,
+              "\n"
+            ]
+            |> IO.iodata_to_binary()
+
+          {[section | sections], warnings ++ warns}
+        end)
+
+      combined =
+        sections_rev
+        |> Enum.reverse()
+        |> Enum.join("\n")
+        |> String.trim()
+
+      {nil, combined, Enum.uniq(warnings_rev)}
+    end
   end
 
   def read_with_includes(path) when is_binary(path) do
@@ -59,7 +89,7 @@ defmodule AgentReviews.Guidelines do
       not File.regular?(path) ->
         {"", ["Include is not a regular file: `#{path}`"]}
 
-      is_symlink?(path) ->
+      symlink?(path) ->
         {"", ["Include is a symlink (blocked): `#{path}`"]}
 
       not within_root?(path, allowed_root) ->
@@ -159,7 +189,7 @@ defmodule AgentReviews.Guidelines do
     path == allowed_root or String.starts_with?(path, allowed_root <> "/")
   end
 
-  defp is_symlink?(path) do
+  defp symlink?(path) do
     case File.lstat(path) do
       {:ok, %File.Stat{type: :symlink}} -> true
       _ -> false
